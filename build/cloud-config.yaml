@@ -1,0 +1,11 @@
+#cloud-config
+
+users:
+  - name: kairos
+    groups:
+      - admin
+    ssh_authorized_keys:
+      - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHo5qJ/2w3UcBUoRkXPxkv7nbL2OXEhpopROI906HPBY ansible-controller"
+
+k3s:
+  enabled: true

@@ -1,0 +1,6 @@
+build/*.raw
+*.img
+*.iso
+.env
+*.key
+*.pem
