@@ -1,47 +1,149 @@
 # Phase 1: Flashing and booting the Kairos Pi
 
-How the Raspberry Pi 4 was initially provisioned — from a stock Kairos hadron image to a bootable USB pen drive running k3s. This is the one-time flashing procedure. All subsequent updates happen via GitHub-managed upgrades (see [phase-2-github-managed.md](phase-2-github-managed.md)).
+How to provision a Raspberry Pi 4 from scratch — from a stock Kairos hadron image to a
+running k3s node with a static IP, SSD-backed storage, and self-updating config from GitHub.
 
-## Goal
+This document covers both Pi 1 (k3s server) and Pi 2 (k3s agent).
 
-Get a Raspberry Pi 4 booting Kairos hadron from a USB pen drive, with k3s running and SSH access via a key. No GitHub integration yet — just a working immutable OS node.
+---
 
 ## Prerequisites
 
-- Raspberry Pi 4 (arm64).
-- USB pen drive (~64 GB) to boot from. An SD card also works, but a pen drive has better endurance for k3s writes.
+- Raspberry Pi 4 (arm64), one or two.
+- USB pen drive (~64 GB) to boot from — one per Pi.
+- USB SSD connected to the Pi — one per Pi. The SSD is auto-detected, formatted, and mounted
+  by `cloud-config/05_ssd_storage.yaml` on first boot.
 - A Linux/Mac host with Docker and `dd`.
-- The Kairos base image tag. We used:
+- The Kairos base image tag:
   `quay.io/kairos/hadron:v0.5.1-standard-arm64-rpi4-v4.2.0-k3s-v1.36.3-k3s1`
 
-> **Tag format gotcha:** `kairos-agent upgrade list-releases` displays the image as `k3sv1.36.3+k3s1`, but the actual pullable quay.io tag uses hyphens: `k3s-v1.36.3-k3s1`. The `+` character is invalid in Docker tags. Always verify the tag against the quay.io API or web UI before using it in a `FROM` or `docker pull`.
+> **Tag format gotcha:** `kairos-agent upgrade list-releases` displays the image as
+> `k3sv1.36.3+k3s1`, but the actual quay.io tag uses hyphens: `k3s-v1.36.3-k3s1`.
+> The `+` character is invalid in Docker tags.
 
-## Step 1: Build the flash image with AuroraBoot
+---
 
-AuroraBoot wraps the upstream Kairos container image into a bootable `.raw` and injects a cloud-config.
+## Architecture
 
-Create a local working directory (this is the gitignored `build/` dir; do **not** commit its contents):
+```
+Pi 1 (192.168.1.34) — k3s server + control plane
+  ├── USB pen drive → Kairos OS (immutable)
+  └── USB SSD → k3s data (containerd images, etcd, PVCs)
+       /usr/local/ssd/k3s-data/       ← all k3s data (containerd layers live here!)
+       /usr/local/ssd/k3s-storage/    ← PVC storage (Prometheus data, Grafana DB)
+
+Pi 2 (192.168.1.35) — k3s agent (worker only)
+  ├── USB pen drive → Kairos OS (immutable)
+  └── USB SSD → k3s data (containerd images, PVCs)
+```
+
+**Why the SSD for k3s data?** Grafana's JS files and all container image layers are served
+from containerd's overlay filesystem. On a USB pen drive, even a single 87KB file takes 30s
+to read. On an SSD, the same file reads in milliseconds. The `data-dir` setting moves ALL
+k3s data (containerd, etcd, TLS certs, PVCs) to the SSD from first boot — no migration ever
+needed.
+
+---
+
+## Step 1: Write the flash-time cloud-config
+
+The flash-time config is **per-Pi** and is **not committed to this repo** (it contains a
+password). Write it to `build/cloud-config-pi1.yaml` (gitignored).
+
+### Pi 1 — k3s server, 192.168.1.34
 
 ```bash
 mkdir -p build
 ```
 
-Write the **flash-time** cloud-config to `build/cloud-config.yaml`. At minimum this needs a user, SSH key, and k3s enabled:
-
 ```yaml
+# build/cloud-config-pi1.yaml — Pi 1 (k3s server)
+# This file is PER-PI and NOT committed to the repo.
+# It contains: user/SSH, static IP, k3s server, and git-pull bootstrap.
+# Everything else (SSD storage, k8s workloads) comes from the git repo
+# via 10_git-pull.yaml on subsequent boots.
+#
 #cloud-config
 users:
   - name: kairos
-    passwd: "Kairo@987"          # flash-time only; NOT committed to the repo
+    passwd: "Kairo@987"
     groups:
       - admin
     ssh_authorized_keys:
       - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHo5qJ/2w3UcBUoRkXPxkv7nbL2OXEhpopROI906HPBY ansible-controller"
+
 k3s:
   enabled: true
+
+write_files:
+  # --- Static IP ---
+  # Override 20-dhcp.network to NOT match end0 (the Pi 4 Ethernet interface).
+  # systemd-networkd merges all matching .network files (later names override
+  # earlier ones for conflicting keys). By making 20-dhcp.network exclude end0,
+  # our static config below is the sole match for end0.
+  - path: /etc/systemd/network/20-dhcp.network
+    permissions: "0644"
+    content: |
+      [Match]
+      Name=en* !end0
+
+      [Network]
+      DHCP=yes
+      [DHCP]
+      ClientIdentifier=mac
+
+  # Static IP for Pi 1. Name=end0 is the Pi 4's built-in Gigabit Ethernet.
+  - path: /etc/systemd/network/99-end0-static.network
+    permissions: "0644"
+    content: |
+      [Match]
+      Name=end0
+
+      [Network]
+      DHCP=no
+      Address=192.168.1.34/24
+      Gateway=192.168.1.1
+      DNS=192.168.1.1
+      DNS=8.8.8.8
+
+  # --- Git-pull bootstrap ---
+  # This is the ONLY cloud-config file that must be written at flash time.
+  # On every boot it pulls the repo and syncs cloud-config/*.yaml into /oem/,
+  # making all other config self-updating via GitHub.
+  - path: /oem/10_git-pull.yaml
+    permissions: "0644"
+    content: |
+      #cloud-config
+      stages:
+        boot:
+          - name: "Pull config repo and sync cloud-config"
+            commands:
+              - |
+                set -e
+                mkdir -p /oem/cloud-config-files
+                tmpdir=$(mktemp -d)
+                curl -sL "https://github.com/shashankpai/kairos-test/archive/refs/heads/main.tar.gz" -o "$tmpdir/repo.tar.gz"
+                rm -rf /oem/cloud-config-files/*
+                tar xzf "$tmpdir/repo.tar.gz" -C /oem/cloud-config-files/ --strip-components=1
+                rm -rf "$tmpdir"
+                if [ -d /oem/cloud-config-files/cloud-config ]; then
+                  for f in /oem/cloud-config-files/cloud-config/*.yaml; do
+                    [ -f "$f" ] && cp "$f" /oem/
+                  done
+                fi
 ```
 
-Run AuroraBoot to produce the `.raw`:
+> **Note:** The `write_files` for `20-dhcp.network` replaces the stock Kairos DHCP config
+> with one that excludes `end0`. Without this, systemd-networkd applies both DHCP and static
+> configs to `end0`, with the DHCP config winning because `20-dhcp.network` is applied after
+> our `99-end0-static.network` alphabetically.
+
+---
+
+## Step 2: Build the flash image with AuroraBoot
+
+AuroraBoot wraps the upstream Kairos container image into a bootable `.raw` and injects the
+cloud-config.
 
 ```bash
 KAIROS_IMAGE=quay.io/kairos/hadron:v0.5.1-standard-arm64-rpi4-v4.2.0-k3s-v1.36.3-k3s1
@@ -56,136 +158,225 @@ sudo docker run --rm --privileged \
   --set "state_dir=/output" \
   --set "disk.raw=true" \
   --set "arch=arm64" \
-  --cloud-config /output/cloud-config.yaml \
+  --cloud-config /output/cloud-config-pi1.yaml \
   --set "container_image=$KAIROS_IMAGE"
 ```
 
-Output: `build/kairos-hadron-v0.5.1-standard-arm64-rpi4-v4.2.0-k3s-v1.36.3-k3s1.raw`.
+Output: `build/kairos-hadron-*.raw`
 
-## Step 2: Flash to the USB pen drive
+---
 
-Identify the device (`diskutil list` on macOS, `lsblk` on Linux). **This destroys all data on the target device — verify the device path carefully.**
+## Step 3: Flash to the USB pen drive
+
+Identify the device (`diskutil list` on macOS, `lsblk` on Linux).
+**This destroys all data on the target device — verify the device path carefully.**
 
 ```bash
+# On macOS (use /dev/rdiskN for raw disk, unmount first):
+diskutil unmountDisk /dev/diskN
+sudo dd \
+  if=build/kairos-hadron-*.raw \
+  of=/dev/rdiskN \
+  bs=4m
+
 # On Linux:
 sudo dd \
-  if=build/kairos-hadron-v0.5.1-standard-arm64-rpi4-v4.2.0-k3s-v1.36.3-k3s1.raw \
+  if=build/kairos-hadron-*.raw \
   of=/dev/sdX \
   bs=4M \
   status=progress \
   conv=fsync
-
-# On macOS, use /dev/rdiskN (raw disk, faster) and unmount first:
-diskutil unmountDisk /dev/diskN
-sudo dd \
-  if=build/kairos-hadron-v0.5.1-standard-arm64-rpi4-v4.2.0-k3s-v1.36.3-k3s1.raw \
-  of=/dev/rdiskN \
-  bs=4m \
-  status=progress
 ```
 
-## Step 3: Boot the Pi
+---
 
-1. Plug the USB pen drive into the Pi 4.
-2. Power on. On first boot, Kairos creates the `COS_STATE` and `COS_PERSISTENT` volumes and reboots once automatically.
-3. After the automatic reboot, the Pi should be on the network via DHCP.
+## Step 4: Boot Pi 1
 
-## Step 4: Verify the node
-
-Find the Pi's IP (check your router's DHCP leases, or use `nmap`/`arp`). SSH in:
+1. Plug the flashed USB pen drive and the USB SSD into the Pi 4.
+2. Power on. On first boot, Kairos creates the `COS_STATE` and `COS_PERSISTENT` partitions
+   and reboots automatically.
+3. After the reboot, SSH in at **192.168.1.34**:
 
 ```bash
-ssh -i ~/.ssh/id_ed25519 kairos@<pi-ip>
+ssh -i ~/.ssh/id_ed25519 kairos@192.168.1.34
 ```
 
-Verify the OS and k3s:
+Verify:
+```bash
+# Static IP is set correctly
+ip addr show end0 | grep inet
+
+# k3s is running
+sudo systemctl status k3s | head -5
+
+# SSD is mounted
+mountpoint -q /usr/local/ssd && echo "SSD mounted" || echo "SSD not mounted"
+
+# k3s data is on the SSD (05_ssd_storage.yaml sets this up)
+ls /usr/local/ssd/k3s-data/ 2>/dev/null || echo "Waiting for first git-pull boot..."
+
+# All monitoring pods eventually come up (allow 3-5 min for image pulls)
+sudo k3s kubectl get pods -n monitoring
+```
+
+> **First boot takes 3–5 minutes** for image pulls. The git-pull runs at the `boot` stage,
+> syncing `05_ssd_storage.yaml` and `20_k8s_workloads.yaml` into `/oem/`. On the SECOND
+> boot, the SSD data-dir config is applied and k3s uses the SSD for all data.
+
+---
+
+## Pi 2 — k3s agent, 192.168.1.35
+
+### Pre-requisite: get the k3s node token from Pi 1
 
 ```bash
-# Check the image version
-sudo kairos-agent upgrade list-releases
+ssh -i ~/.ssh/id_ed25519 kairos@192.168.1.34
+sudo cat /var/lib/rancher/k3s/server/node-token
+# Copy this token — you'll need it below
+```
 
-# Check k3s (kubectl is embedded in k3s; kubeconfig is root-only)
+### Pi 2 flash-time cloud-config
+
+```yaml
+# build/cloud-config-pi2.yaml — Pi 2 (k3s agent/worker)
+# This file is PER-PI and NOT committed to the repo.
+#
+#cloud-config
+users:
+  - name: kairos
+    passwd: "Kairo@987"
+    groups:
+      - admin
+    ssh_authorized_keys:
+      - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHo5qJ/2w3UcBUoRkXPxkv7nbL2OXEhpopROI906HPBY ansible-controller"
+
+k3s-agent:
+  enabled: true
+  env:
+    K3S_URL: "https://192.168.1.34:6443"
+    K3S_TOKEN: "PASTE_TOKEN_FROM_PI1_HERE"
+
+write_files:
+  # Same static IP fix as Pi 1 — override DHCP to exclude end0
+  - path: /etc/systemd/network/20-dhcp.network
+    permissions: "0644"
+    content: |
+      [Match]
+      Name=en* !end0
+
+      [Network]
+      DHCP=yes
+      [DHCP]
+      ClientIdentifier=mac
+
+  # Static IP for Pi 2
+  - path: /etc/systemd/network/99-end0-static.network
+    permissions: "0644"
+    content: |
+      [Match]
+      Name=end0
+
+      [Network]
+      DHCP=no
+      Address=192.168.1.35/24
+      Gateway=192.168.1.1
+      DNS=192.168.1.1
+      DNS=8.8.8.8
+
+  # Git-pull bootstrap (same content as Pi 1)
+  - path: /oem/10_git-pull.yaml
+    permissions: "0644"
+    content: |
+      #cloud-config
+      stages:
+        boot:
+          - name: "Pull config repo and sync cloud-config"
+            commands:
+              - |
+                set -e
+                mkdir -p /oem/cloud-config-files
+                tmpdir=$(mktemp -d)
+                curl -sL "https://github.com/shashankpai/kairos-test/archive/refs/heads/main.tar.gz" -o "$tmpdir/repo.tar.gz"
+                rm -rf /oem/cloud-config-files/*
+                tar xzf "$tmpdir/repo.tar.gz" -C /oem/cloud-config-files/ --strip-components=1
+                rm -rf "$tmpdir"
+                if [ -d /oem/cloud-config-files/cloud-config ]; then
+                  for f in /oem/cloud-config-files/cloud-config/*.yaml; do
+                    [ -f "$f" ] && cp "$f" /oem/
+                  done
+                fi
+```
+
+Build and flash using the same AuroraBoot command, substituting `cloud-config-pi2.yaml`.
+
+Verify Pi 2 joined the cluster:
+```bash
+# From Pi 1:
 sudo k3s kubectl get nodes -o wide
+# Should show both kairos-XXXX nodes: one control-plane, one <none> (agent)
 ```
 
-Expected output:
-```
-NAME          STATUS   ROLES           AGE   VERSION        INTERNAL-IP    OS-IMAGE       KERNEL-VERSION         CONTAINER-RUNTIME
-kairos-XXXX   Ready    control-plane   Xm    v1.36.3+k3s1   192.168.1.X    Hadron Linux   7.1.3-hadron (arm64)   containerd://2.3.2-k3s2
-```
-
-Verify the disk and partitions:
-
-```bash
-lsblk
-# Should show the USB pen drive with COS_STATE, COS_PERSISTENT, and OEM partitions
-```
+---
 
 ## What you have at the end of Phase 1
 
-- A Raspberry Pi 4 booting Kairos hadron v0.5.1 from a USB pen drive.
-- k3s running as a single-node control plane.
-- SSH access via the `kairos` user with your ed25519 key.
-- No GitHub integration, no custom image, no boot-time config pull.
-- The `/oem/` directory contains only `90_custom.yaml` (the flash-time cloud-config) and `grubenv`.
+- **Pi 1**: k3s server at 192.168.1.34, static IP, SSD-backed k3s data
+- **Pi 2**: k3s agent at 192.168.1.35, static IP, SSD-backed k3s data
+- Both Pis self-update cloud-config from GitHub on every boot
+- Monitoring stack (Grafana, Prometheus, node-exporter, kube-state-metrics) deployed on Pi 1
 
-## Troubleshooting encountered during Phase 1
+---
+
+## Troubleshooting
+
+### Static IP not applied after first boot
+
+The `20-dhcp.network` override in the flash-time config prevents networkd from assigning a
+DHCP address to `end0`. If the IP is still dynamic after first boot:
+
+```bash
+# Check which network file is active
+sudo networkctl status end0
+
+# Verify our files are in place
+sudo ls -la /etc/systemd/network/
+sudo cat /etc/systemd/network/99-end0-static.network
+
+# Force reconfigure
+sudo networkctl reload && sudo networkctl reconfigure end0
+```
 
 ### k3s not starting after first boot
 
-The `kairos-agent` first-boot service writes `/etc/sysconfig/k3s`. If it didn't run (check `journalctl -fu kairos-agent` for the first boot), k3s won't be configured.
-
-**Fix:** Remove the first-boot sentinel to force the agent to re-run:
-
 ```bash
-sudo rm /usr/local/.kairos/deployed
-sudo reboot
+sudo journalctl -u k3s.service --no-pager | grep -i "error\|fatal" | tail -20
+# If data-dir is on SSD and SSD isn't mounted yet, k3s fails.
+# Check SSD mount: mountpoint -q /usr/local/ssd && echo mounted
+# The usr-local-ssd.mount service must start before k3s:
+sudo systemctl status usr-local-ssd.mount
 ```
-
-### Can't SSH in
-
-- Verify the Pi is on the network: `ping <pi>`, check router DHCP leases.
-- The flash-time cloud-config must have your SSH key in `users[*].ssh_authorized_keys`. If you forgot it, you'll need to re-flash or attach a monitor + keyboard and edit `/oem/90_custom.yaml` from a recovery boot.
-- If you used a password and it's not working, recovery boot and check `/oem/90_custom.yaml`.
 
 ### k3s kubectl permission denied
 
-On Kairos, the kubeconfig is root-only. You must use `sudo k3s kubectl` instead of plain `kubectl`:
-
 ```bash
-# Wrong:
-kubectl get nodes                    # permission denied
-
-# Right:
-sudo k3s kubectl get nodes           # works
+# Always use sudo on Kairos
+sudo k3s kubectl get nodes
 ```
 
-### USB pen drive wear / endurance
+### Images pulling slowly on first boot
 
-This node boots from a ~64 GB USB pen drive rather than an SSD. Pen drives typically have lower write endurance (fewer erase cycles per cell) and slower random I/O than SSDs. Most of the Kairos rootfs is read-only (immutable), so the OS itself isn't a wear concern. The risk is the **persistent partition** (`/usr/local` and `/oem`), which k3s writes to — k3s stores its state in a sqlite-backed etcd (`/var/lib/rancher/k3s/server/db/`), and frequent small writes can wear out cheaper flash over months of uptime.
-
-Symptoms of flash wear:
-- k3s becomes unstable, nodes flap, or `kubectl get nodes` intermittently fails.
-- Filesystem errors in `dmesg` (I/O errors, remounted read-only).
-- Slow boot or upgrade times that progressively worsen.
-
-Mitigations, in order of effort:
-- Move k3s state to an external SSD or a separate, higher-endurance USB device (bind-mount `/var/lib/rancher/k3s`).
-- Use `k3s`'s embedded etcd with a WAL on a more durable medium, or switch the node to a k3s **agent** pointing at a server elsewhere (no local etcd).
-- Reduce k3s write frequency (e.g. disable unused controllers, lower `--kube-controller-manager` sync periods) — marginal gains.
-- Replace the pen drive with a USB SSD or a higher-endurance industrial SD card + USB adapter.
+Container images are pulled directly to the SSD (`/usr/local/ssd/k3s-data/agent/containerd/`).
+First pull takes a few minutes depending on your network. Subsequent boots are instant
+(images are cached on SSD).
 
 ### Boot loop after upgrade
 
-Kairos should auto-fall-back to the passive image after a few failed boots. If it doesn't, or if you want to force it:
-
-1. Interrupt GRUB at boot (hold a key during the menu).
-2. Choose the passive or recovery entry.
-3. From recovery, roll back as described in [phase-2-github-managed.md](phase-2-github-managed.md#manual-rollback).
+Kairos auto-falls-back to the passive image after a few failed boots. To force rollback:
+1. Interrupt GRUB at boot.
+2. Choose the passive entry.
+3. From recovery: `sudo kairos-agent rollback`
 
 ### Inspecting partitions from recovery
-
-From the recovery system, the active/passive state partition is mounted under `/run/initramfs/cos-state`:
 
 ```bash
 ls /run/initramfs/cos-state/cOS/
