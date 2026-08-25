@@ -14,11 +14,15 @@
 
 FROM quay.io/kairos/hadron:v0.5.1-standard-arm64-rpi4-v4.2.0-k3s-v1.36.3-k3s1
 
-# Add customizations below. Hadron is Alpine-based, so use apk.
-# Example:
-#   RUN apk add --no-cache figlet
-# Or copy in config files:
-#   COPY my-config.toml /etc/foo/config.toml
+# Add customizations below. Hadron is a musl-based immutable system; it does
+# NOT ship apk. To add packages, you must use the Kairos bundles mechanism or
+# build from a base distro with kairos-init. For now, we only stamp a version.
+#
+# NOTE: Hadron v0.5.1 is a "nogit" build — git is not installed and the
+# kairos-agent git stage plugin is unavailable. Our cloud-config uses
+# curl+tar instead (see cloud-config/10_git-pull.yaml). If we ever need
+# the native git stage module, we'd need to build from a base that includes
+# git or add it via a bundle.
 
 # Stamp a custom version so `kairos-agent upgrade list-releases` and
 # /etc/os-release identify this as our image, not stock hadron.

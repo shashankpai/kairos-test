@@ -18,8 +18,8 @@ A Kairos node treated as a declarative artifact: the OS image and the runtime co
         v
    Raspberry Pi 4 (arm64, USB pen drive ~64 GB)
         |
-        |  on every boot, stages.boot.git pulls:
-        |    https://github.com/shashankpai/kairos-test.git -> /oem/cloud-config-files
+        |  on every boot, stages.boot.commands downloads:
+        |    https://github.com/shashankpai/kairos-test/archive/main.tar.gz -> /oem/cloud-config-files
         v
    /oem/*.yaml applied in lexicographic order by Kairos cloud-init
 ```

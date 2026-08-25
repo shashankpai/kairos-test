@@ -21,8 +21,8 @@ sudo journalctl -b | grep -i 'cloud-init\|kairos\|stage'
 
 Common causes:
 - YAML syntax error — validate locally with `yq` or `python -c 'import yaml; yaml.safe_load(open("f.yaml"))'`.
-- `stages.boot.git` auth failure (private repo, missing/wrong deploy key) — see [03-config-management.md](03-config-management.md).
-- `commands:` referencing a binary not in the image — add it to `image/Dockerfile` instead.
+- **`git plugin not available in nogit build`** — Hadron v0.5.1 is a "nogit" build. The `stages.boot.git` module is not available, and `git` is not installed. Use `stages.boot.commands` with `curl` + `tar` instead (see `cloud-config/10_git-pull.yaml` for the working pattern).
+- `commands:` referencing a binary not in the image — hadron doesn't ship `apk`, so you can't install packages at runtime. Add it to `image/Dockerfile` and rebuild, or use a different approach (e.g., `curl` instead of `git`).
 
 ## k3s not starting
 

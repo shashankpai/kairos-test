@@ -38,13 +38,18 @@ k3s:
 stages:
   boot:
     - name: "Pull config repo"
-      git:
-        url: "https://github.com/shashankpai/kairos-test.git"
-        path: "/oem/cloud-config-files"
-        branch: "main"
+      commands:
+        - |
+          set -e
+          mkdir -p /oem/cloud-config-files
+          tmpdir=$(mktemp -d)
+          curl -sL "https://github.com/shashankpai/kairos-test/archive/refs/heads/main.tar.gz" -o "$tmpdir/repo.tar.gz"
+          rm -rf /oem/cloud-config-files/*
+          tar xzf "$tmpdir/repo.tar.gz" -C /oem/cloud-config-files/ --strip-components=1
+          rm -rf "$tmpdir"
 ```
 
-> If the repo is **private**, add `auth.insecure: true` and `auth.private_key: |` with a GitHub deploy key under the `git` entry. The private key must never be committed.
+> If the repo is **private**, embed a GitHub personal access token in the URL: `https://<token>@github.com/...`. The token must never be committed — keep it in the flash-time config only.
 
 Run AuroraBoot:
 

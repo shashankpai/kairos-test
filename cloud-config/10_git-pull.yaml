@@ -2,20 +2,30 @@
 # Pulls this repo into /oem/cloud-config-files on every boot so that
 # config changes pushed to GitHub land on the Pi after a reboot.
 #
-# This file is the source of truth, but note the chicken-and-egg described in
-# docs/03-config-management.md: the flash-time cloud-config (local, gitignored
-# build/cloud-config.yaml) must ALSO contain this stages.boot.git entry, because
-# the Pi cannot pull this file until the pull is already configured.
+# IMPORTANT: Hadron v0.5.1 is a "nogit" build — the kairos-agent git stage
+# plugin is not available, and git is not installed. We use curl + tar
+# to download a tarball of the repo instead. This achieves the same result
+# (repo contents in /oem/cloud-config-files/) without requiring git.
 #
-# The repo is public, so we use HTTPS (no auth needed). Kairos's golang-native
-# git can clone public repos over HTTPS without any credentials.
-# If the repo were PRIVATE, add an `auth:` block with a GitHub deploy key to the
-# flash-time copy only (never commit the private key). See docs/01-flashing.md.
+# Once we upgrade to our custom image (which bakes in git via the Dockerfile),
+# we can switch back to the native git stage module if desired. But curl+tar
+# is lighter and works on the current image.
+#
+# The repo is public, so no auth is needed.
+# If the repo were PRIVATE, use a GitHub personal access token in the URL:
+#   https://<token>@github.com/shashankpai/kairos-test/archive/refs/heads/main.tar.gz
+# (never commit the token — put it in the flash-time config only).
 
 stages:
   boot:
     - name: "Pull config repo"
-      git:
-        url: "https://github.com/shashankpai/kairos-test.git"
-        path: "/oem/cloud-config-files"
-        branch: "main"
+      commands:
+        - |
+          set -e
+          mkdir -p /oem/cloud-config-files
+          # Download the repo tarball and extract it, replacing any previous copy
+          tmpdir=$(mktemp -d)
+          curl -sL "https://github.com/shashankpai/kairos-test/archive/refs/heads/main.tar.gz" -o "$tmpdir/repo.tar.gz"
+          rm -rf /oem/cloud-config-files/*
+          tar xzf "$tmpdir/repo.tar.gz" -C /oem/cloud-config-files/ --strip-components=1
+          rm -rf "$tmpdir"
