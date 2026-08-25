@@ -182,9 +182,12 @@ spec:
               value: "false"
             - name: GF_INSTALL_PLUGINS
               value: ""
+            - name: GF_SERVER_SERVE_FROM_SUB_PATH
+              value: "false"
           ports:
             - containerPort: 3000
               name: web
+              hostPort: 3000
           volumeMounts:
             - name: datasources
               mountPath: /etc/grafana/provisioning/datasources
@@ -232,11 +235,10 @@ metadata:
   name: grafana
   namespace: monitoring
 spec:
-  type: NodePort
+  type: ClusterIP
   selector:
     app: grafana
   ports:
     - port: 3000
       targetPort: 3000
-      nodePort: 30300
       name: web
