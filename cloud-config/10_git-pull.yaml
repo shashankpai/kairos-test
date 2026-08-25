@@ -2,14 +2,25 @@
 # Pulls this repo into /oem/cloud-config-files on every boot so that
 # config changes pushed to GitHub land on the Pi after a reboot.
 #
+# This is the self-updating mechanism: the repo is the single source of
+# truth for BOTH the cloud-config files AND the k8s workloads. On every
+# boot, this stage:
+#   1. Downloads the repo tarball to /oem/cloud-config-files/
+#   2. Syncs cloud-config/*.yaml from the repo into /oem/ itself
+#      so new/changed cloud-config files are picked up on the next boot
+#   3. The k8s/ manifests are applied separately by 20_k8s_workloads.yaml
+#      (network + reconcile stages)
+#
+# This means you NEVER need to SSH in to add a new cloud-config file.
+# Just push it to the repo's cloud-config/ directory, and the Pi will
+# self-update on the next boot. The only file that must be written
+# manually (at flash time) is this one (10_git-pull.yaml) — it's the
+# bootstrap that makes everything else self-updating.
+#
 # IMPORTANT: Hadron v0.5.1 is a "nogit" build — the kairos-agent git stage
 # plugin is not available, and git is not installed. We use curl + tar
 # to download a tarball of the repo instead. This achieves the same result
 # (repo contents in /oem/cloud-config-files/) without requiring git.
-#
-# Once we upgrade to our custom image (which bakes in git via the Dockerfile),
-# we can switch back to the native git stage module if desired. But curl+tar
-# is lighter and works on the current image.
 #
 # The repo is public, so no auth is needed.
 # If the repo were PRIVATE, use a GitHub personal access token in the URL:
@@ -18,7 +29,7 @@
 
 stages:
   boot:
-    - name: "Pull config repo"
+    - name: "Pull config repo and sync cloud-config"
       commands:
         - |
           set -e
@@ -29,3 +40,14 @@ stages:
           rm -rf /oem/cloud-config-files/*
           tar xzf "$tmpdir/repo.tar.gz" -C /oem/cloud-config-files/ --strip-components=1
           rm -rf "$tmpdir"
+          # Sync cloud-config files from the repo into /oem/ so they are
+          # processed by kairos-agent on the next boot. This makes the
+          # cloud-config self-updating — push a new file to the repo's
+          # cloud-config/ directory, and the Pi picks it up automatically.
+          # We do NOT touch 90_custom.yaml (flash-time config with secrets)
+          # or any file not in the repo's cloud-config/ directory.
+          if [ -d /oem/cloud-config-files/cloud-config ]; then
+            for f in /oem/cloud-config-files/cloud-config/*.yaml; do
+              [ -f "$f" ] && cp "$f" /oem/
+            done
+          fi

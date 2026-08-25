@@ -75,9 +75,25 @@ This is the Kairos-native GitOps pattern. The cloud-config itself is the reconci
 The flow, step by step:
 
 1. **Boot** — Pi boots from the active A/B partition.
-2. **`boot` stage** — The `10_git-pull.yaml` cloud-config runs `curl+tar` to download this repo to `/oem/cloud-config-files/`. This includes both `cloud-config/*.yaml` and `k8s/*.yaml`.
+2. **`boot` stage** — The `10_git-pull.yaml` cloud-config runs `curl+tar` to download this repo to `/oem/cloud-config-files/`. This includes both `cloud-config/*.yaml` and `k8s/*.yaml`. It then **syncs** the repo's `cloud-config/*.yaml` files into `/oem/` itself, so any new or changed cloud-config files are picked up on the next boot. This makes the cloud-config **self-updating** — you never need to SSH in to add a new cloud-config file. Just push to the repo, reboot the Pi, and it converges.
 3. **`network` stage** — The `20_k8s_workloads.yaml` cloud-config waits for k3s to be ready (polls `kubectl get nodes` for up to 5 minutes), then runs `kubectl apply -f /oem/cloud-config-files/k8s/` to deploy all workloads.
 4. **`reconcile` stage** — 5 minutes after boot, then every 60 minutes, the same `kubectl apply` runs again. If a pod was deleted, a config was changed, or a new manifest was added to the repo (and pulled on the next boot), the cluster converges back to the desired state.
+
+### Self-updating cloud-config (production pattern)
+
+In a production Kairos deployment, the repo is the single source of truth for **everything** — not just k8s workloads but also the cloud-config files themselves. The `10_git-pull.yaml` stage achieves this by:
+
+1. Downloading the repo (including `cloud-config/*.yaml`)
+2. Copying `cloud-config/*.yaml` from the downloaded repo into `/oem/`
+
+This means:
+- **Add a new cloud-config file** → push it to `cloud-config/` in the repo → reboot the Pi → it's automatically picked up
+- **Change an existing cloud-config file** → push the change → reboot → the updated version is applied
+- **No manual SSH** needed to update cloud-config (except for the initial bootstrap at flash time)
+
+The only file that must be written manually (at flash time) is `10_git-pull.yaml` itself — it's the bootstrap that makes everything else self-updating. This is the chicken-and-egg resolution: the flash-time config contains `10_git-pull.yaml`, which then pulls the repo (including an updated `10_git-pull.yaml`) and syncs it to `/oem/`.
+
+**Safety:** The sync only copies files from the repo's `cloud-config/` directory. It does NOT touch `90_custom.yaml` (the flash-time config with secrets like the initial password and k3s token) or any other file in `/oem/` that isn't in the repo.
 
 ### Files created
 
