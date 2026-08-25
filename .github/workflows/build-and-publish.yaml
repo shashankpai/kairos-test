@@ -1,0 +1,106 @@
+name: Build and publish Kairos Pi image
+
+# Builds the custom Kairos image (image/Dockerfile) for linux/arm64 and
+# pushes it to GHCR so the Pi can upgrade with:
+#   sudo kairos-agent upgrade --source oci:ghcr.io/shashankpai/kairos-pi:<tag>
+#
+# On pushes to main: tags :latest and :sha-<short>.
+# On tags matching v*: tags :vX.Y.Z and :latest, and produces a .raw flash
+#   artifact attached to the GitHub Release (so a fresh node can be flashed
+#   with the same image used for upgrades).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'image/**'
+      - '.github/workflows/build-and-publish.yaml'
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/kairos-pi
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # for GitHub Release upload on tag builds
+      packages: write   # for GHCR push
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU (for arm64 emulation on amd64 runner)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: tags
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            ver="${GITHUB_REF#refs/tags/}"
+            echo "tags=${IMAGE}:${ver},${IMAGE}:latest" >> "$GITHUB_OUTPUT"
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+          else
+            short=$(git rev-parse --short HEAD)
+            echo "tags=${IMAGE}:latest,${IMAGE}:sha-${short}" >> "$GITHUB_OUTPUT"
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: image
+          file: image/Dockerfile
+          platforms: linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            KAIROS_TEST_VERSION=${{ github.ref_name == 'main' && format('sha-{0}', github.sha) || github.ref_name }}
+
+      # On tag builds, also produce a .raw flash artifact via AuroraBoot and
+      # attach it to the GitHub Release. This mirrors the manual flashing
+      # procedure in docs/01-flashing.md but uses our custom GHCR image.
+      - name: Build .raw flash artifact
+        if: steps.tags.outputs.is_release == 'true'
+        run: |
+          mkdir -p build
+          # The cloud-config for the flash artifact is the union of the
+          # canonical cloud-config files in this repo. Concatenate them in
+          # lexicographic order (Kairos applies /oem/*.yaml the same way).
+          cat cloud-config/00_base.yaml > build/cloud-config.yaml
+          # 10_git-pull.yaml is added in Phase 2; include it if present.
+          [ -f cloud-config/10_git-pull.yaml ] && cat cloud-config/10_git-pull.yaml >> build/cloud-config.yaml
+          # AuroraBoot needs a real cloud-config file path, not a stream.
+          docker run --rm --privileged \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD/build:/output" \
+            quay.io/kairos/auroraboot:latest \
+            --debug \
+            --set "disable_http_server=true" \
+            --set "disable_netboot=true" \
+            --set "state_dir=/output" \
+            --set "disk.raw=true" \
+            --set "arch=arm64" \
+            --cloud-config /output/cloud-config.yaml \
+            --set "container_image=${IMAGE}:${GITHUB_REF_NAME}"
+          # Find the produced .raw and zip it for the release.
+          raw=$(ls build/*.raw | head -n1)
+          gzip -9 "$raw"
+
+      - name: Create / update GitHub Release
+        if: steps.tags.outputs.is_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/*.raw.gz
+          generate_release_notes: true

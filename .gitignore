@@ -1,6 +1,12 @@
 build/*.raw
-*.img
-*.iso
+build/*.raw.gz
+build/*.img
+build/*.iso
+# The flash-time cloud-config may contain the initial password and/or a
+# GitHub deploy private key. Never commit it.
+build/cloud-config.yaml
 .env
 *.key
 *.pem
+*.id_rsa
+id_rsa*

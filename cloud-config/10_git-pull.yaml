@@ -1,0 +1,19 @@
+#cloud-config
+# Pulls this repo into /oem/cloud-config-files on every boot so that
+# config changes pushed to GitHub land on the Pi after a reboot.
+#
+# This file is the source of truth, but note the chicken-and-egg described in
+# docs/03-config-management.md: the flash-time cloud-config (local, gitignored
+# build/cloud-config.yaml) must ALSO contain this stages.boot.git entry, because
+# the Pi cannot pull this file until the pull is already configured.
+#
+# If this repo is PRIVATE, add an `auth:` block with a GitHub deploy key to the
+# flash-time copy only (never commit the private key). See docs/01-flashing.md.
+
+stages:
+  boot:
+    - name: "Pull config repo"
+      git:
+        url: "git@github.com:shashankpai/kairos-test.git"
+        path: "/oem/cloud-config-files"
+        branch: "main"
