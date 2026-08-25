@@ -1,6 +1,7 @@
 #cloud-config
-# Mounts the USB SSD and bind-mounts k3s storage to it so all PVCs use
-# fast SSD I/O instead of the slow boot pen drive.
+# Mounts the USB SSD and configures k3s's local-path provisioner to use
+# it for all PVCs, so persistent volumes get fast SSD I/O instead of
+# the slow boot pen drive.
 #
 # Uses partition LABEL "kairos-ssd" (not UUID) so the same cloud-config
 # works on every Pi in the fleet — each Pi's SSD is formatted with the
@@ -14,13 +15,23 @@
 # Why not Longhorn? Longhorn is a distributed block storage system that
 # needs 3+ nodes for quorum and ~1GB RAM overhead. For a 2-Pi edge
 # cluster where each Pi has its own SSD, local-path provisioner + SSD
-# bind-mount is simpler and more resource-efficient. Longhorn is the
-# upgrade path when the fleet grows to 5+ nodes with storage on each.
+# is simpler and more resource-efficient. Longhorn is the upgrade path
+# when the fleet grows to 5+ nodes with storage on each.
 #
-# The mount units are created via write_files and enabled in the fs
-# stage (runs when persistent partitions are mounted, before k3s starts).
-# The bind-mount depends on the SSD mount via Requires/After, ensuring
-# correct ordering.
+# From-scratch flow: plug in a raw/unformatted USB SSD, flash the Pi,
+# boot. The fs stage detects the SSD, formats it with label kairos-ssd
+# (if not already formatted), mounts it, and the network stage patches
+# the local-path provisioner to use it. No manual steps needed.
+#
+# Three things happen:
+# 1. fs stage: detects, formats (if needed), and mounts the SSD
+# 2. network stage: patches the local-path provisioner ConfigMap to use
+#    /usr/local/ssd/k3s-storage as the storage path (after k3s is up)
+# 3. reconcile stage: re-applies the provisioner patch (drift correction)
+#
+# The SSD is detected as the largest non-boot disk. On a Pi booting from
+# a USB pen drive, the SSD will typically be /dev/sdb. We detect it by
+# checking for the largest disk that isn't the boot device.
 
 write_files:
   - path: /etc/systemd/system/usr-local-ssd.mount
@@ -39,39 +50,121 @@ write_files:
 
       [Install]
       WantedBy=multi-user.target
-  - path: /etc/systemd/system/var-lib-rancher-k3s\x2dstorage.mount
-    permissions: 0644
-    content: |
-      [Unit]
-      Description=Bind-mount k3s storage to SSD
-      Requires=usr-local-ssd.mount
-      After=usr-local-ssd.mount
-      Before=k3s.service
-
-      [Mount]
-      What=/usr/local/ssd/k3s-storage
-      Where=/var/lib/rancher/k3s/storage
-      Type=none
-      Options=bind
-
-      [Install]
-      WantedBy=multi-user.target
 
 stages:
   fs:
-    - name: "Set up SSD storage"
+    - name: "Detect, format, and mount SSD"
       commands:
         - |
-          # Create mount points on the persistent partition (rootfs is read-only)
+          # Create mount point on the persistent partition (rootfs is read-only)
           mkdir -p /usr/local/ssd /usr/local/ssd/k3s-storage
-          # Create k3s storage directory if it doesn't exist (needed for bind-mount)
-          mkdir -p /var/lib/rancher/k3s/storage
-          # Reload systemd to pick up the new mount units
+
+          # Check if the SSD is already mounted (e.g., from a previous boot)
+          if mountpoint -q /usr/local/ssd; then
+            exit 0
+          fi
+
+          # Check if a partition with label kairos-ssd already exists
+          if blkid -L kairos-ssd >/dev/null 2>&1; then
+            # SSD is already formatted — just mount it
+            systemctl daemon-reload
+            systemctl enable usr-local-ssd.mount
+            systemctl start usr-local-ssd.mount
+            exit 0
+          fi
+
+          # SSD is not formatted — find the SSD device.
+          # Strategy: find the largest disk that is NOT the boot device.
+          # The boot device is the one containing the COS_STATE partition
+          # or the root filesystem.
+          BOOT_DISK=""
+          # Find which disk has the COS_STATE partition (Kairos boot marker)
+          for dev in /dev/sd[a-z] /dev/nvme[0-9]n[0-9]; do
+            [ -b "$dev" ] || continue
+            if blkid "$dev" 2>/dev/null | grep -q "COS_STATE\|COS_PERSISTENT\|cos-state" || \
+               lsblk -no PARTLABEL "$dev" 2>/dev/null | grep -qi "COS"; then
+              BOOT_DISK="$dev"
+              break
+            fi
+          done
+          # Fallback: the boot disk is the one mounted at /
+          if [ -z "$BOOT_DISK" ]; then
+            BOOT_DISK=$(findmnt -no SOURCE / | sed 's/[0-9]*$//' | sed 's/p$//')
+          fi
+
+          # Find the largest disk that isn't the boot disk
+          SSD_DISK=""
+          SSD_SIZE=0
+          for dev in /dev/sd[a-z] /dev/nvme[0-9]n[0-9]; do
+            [ -b "$dev" ] || continue
+            [ "$dev" = "$BOOT_DISK" ] && continue
+            size=$(blockdev --getsize64 "$dev" 2>/dev/null || echo 0)
+            if [ "$size" -gt "$SSD_SIZE" ]; then
+              SSD_DISK="$dev"
+              SSD_SIZE="$size"
+            fi
+          done
+
+          if [ -z "$SSD_DISK" ]; then
+            echo "No SSD found (only boot disk $BOOT_DISK detected). PVCs will use the boot drive."
+            exit 0
+          fi
+
+          echo "Found SSD: $SSD_DISK ($((SSD_SIZE / 1024 / 1024 / 1024)) GB), boot disk: $BOOT_DISK"
+
+          # Wipe any existing partition table and create a single partition
+          wipefs -a "$SSD_DISK" 2>/dev/null || true
+          dd if=/dev/zero of="$SSD_DISK" bs=1M count=10 2>/dev/null || true
+
+          # Create a single partition using fdisk
+          echo -e "o\nn\np\n1\n\n\nw" | fdisk "$SSD_DISK" 2>/dev/null || true
+
+          # Wait for the partition device to appear
+          sleep 2
+          # Handle both /dev/sdX1 and /dev/nvmeXnYp1 naming
+          if [ -b "${SSD_DISK}1" ]; then
+            SSD_PART="${SSD_DISK}1"
+          elif [ -b "${SSD_DISK}p1" ]; then
+            SSD_PART="${SSD_DISK}p1"
+          else
+            echo "Partition not found after fdisk. Trying whole disk."
+            SSD_PART="$SSD_DISK"
+          fi
+
+          # Format with ext4 and the kairos-ssd label
+          mkfs.ext4 -F -L kairos-ssd "$SSD_PART"
+
+          # Mount via systemd
           systemctl daemon-reload
-          # Enable the mount units so they persist across reboots
           systemctl enable usr-local-ssd.mount
-          systemctl enable var-lib-rancher-k3s\\x2dstorage.mount
-          # Mount now if not already mounted
-          mountpoint -q /usr/local/ssd || systemctl start usr-local-ssd.mount
-          # Bind-mount k3s storage if not already mounted
-          mountpoint -q /var/lib/rancher/k3s/storage || systemctl start var-lib-rancher-k3s\\x2dstorage.mount
+          systemctl start usr-local-ssd.mount
+
+          echo "SSD formatted and mounted at /usr/local/ssd"
+  network:
+    - name: "Configure local-path provisioner to use SSD"
+      commands:
+        - |
+          # Wait for k3s API to be ready
+          for i in $(seq 1 60); do
+            if sudo k3s kubectl get nodes >/dev/null 2>&1; then break; fi
+            sleep 5
+          done
+          # Patch the local-path provisioner to use the SSD for all PVCs.
+          # This is idempotent — safe to run on every boot and reconcile.
+          # Only patch if the SSD is actually mounted.
+          if mountpoint -q /usr/local/ssd; then
+            sudo k3s kubectl patch configmap local-path-config -n kube-system \
+              --type='json' \
+              -p='[{"op":"replace","path":"/data/config.json","value":"{\"nodePathMap\":[{\"node\":\"DEFAULT_PATH_FOR_NON_LISTED_NODES\",\"paths\":[\"/usr/local/ssd/k3s-storage\"]}]}"}]' \
+              2>&1 || true
+          fi
+  reconcile:
+    - name: "Reconcile local-path provisioner to SSD"
+      commands:
+        - |
+          if mountpoint -q /usr/local/ssd; then
+            sudo k3s kubectl patch configmap local-path-config -n kube-system \
+              --type='json' \
+              -p='[{"op":"replace","path":"/data/config.json","value":"{\"nodePathMap\":[{\"node\":\"DEFAULT_PATH_FOR_NON_LISTED_NODES\",\"paths\":[\"/usr/local/ssd/k3s-storage\"]}]}"}]' \
+              2>&1 || true
+          fi
