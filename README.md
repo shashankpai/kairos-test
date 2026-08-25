@@ -34,7 +34,7 @@ kairos-test/
 
 | Item | Value |
 | --- | --- |
-| Upstream base | `quay.io/kairos/hadron:v0.5.1-standard-arm64-rpi4-v4.2.0-k3sv1.36.3+k3s1` |
+| Upstream base | `quay.io/kairos/hadron:v0.5.1-standard-arm64-rpi4-v4.2.0-k3s-v1.36.3-k3s1` |
 | Custom image | `ghcr.io/shashankpai/kairos-pi:<tag>` (see [docs/02-upgrades.md](docs/02-upgrades.md)) |
 | Target | Raspberry Pi 4, arm64, USB pen drive (~64 GB) |
 | Kubernetes | k3s (single-node edge) |

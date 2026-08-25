@@ -8,7 +8,7 @@ How the Raspberry Pi 4 was initially provisioned. This is a one-time procedure p
 - USB pen drive (~64 GB) to boot from (an SD card also works).
 - A Linux/Mac host with Docker and `dd`.
 - The Kairos base image tag you want to flash. Current:
-  `quay.io/kairos/hadron:v0.5.1-standard-arm64-rpi4-v4.2.0-k3sv1.36.3+k3s1`
+  `quay.io/kairos/hadron:v0.5.1-standard-arm64-rpi4-v4.2.0-k3s-v1.36.3-k3s1`
 
 ## 1. Build the flash image with AuroraBoot
 
@@ -49,7 +49,7 @@ stages:
 Run AuroraBoot:
 
 ```bash
-KAIROS_IMAGE=quay.io/kairos/hadron:v0.5.1-standard-arm64-rpi4-v4.2.0-k3sv1.36.3+k3s1
+KAIROS_IMAGE=quay.io/kairos/hadron:v0.5.1-standard-arm64-rpi4-v4.2.0-k3s-v1.36.3-k3s1
 
 sudo docker run --rm --privileged \
   -v /var/run/docker.sock:/var/run/docker.sock \
@@ -65,7 +65,7 @@ sudo docker run --rm --privileged \
   --set "container_image=$KAIROS_IMAGE"
 ```
 
-Output: `build/kairos-hadron-v0.5.1-standard-arm64-rpi4-v4.2.0-k3sv1.36.3+k3s1.raw`.
+Output: `build/kairos-hadron-v0.5.1-standard-arm64-rpi4-v4.2.0-k3s-v1.36.3-k3s1.raw`.
 
 ## 2. Flash to the SSD
 
@@ -73,7 +73,7 @@ Identify the device (`diskutil list` on macOS, `lsblk` on Linux). **This destroy
 
 ```bash
 sudo dd \
-  if=~/kairos-pi/build/kairos-hadron-v0.5.1-standard-arm64-rpi4-v4.2.0-k3sv1.36.3+k3s1.raw \
+  if=~/kairos-pi/build/kairos-hadron-v0.5.1-standard-arm64-rpi4-v4.2.0-k3s-v1.36.3-k3s1.raw \
   of=/dev/sdd \
   bs=4M \
   status=progress \

@@ -12,7 +12,7 @@
 # The GitHub Actions workflow in .github/workflows/build-and-publish.yaml
 # handles platform, tagging, and pushing to GHCR.
 
-FROM quay.io/kairos/hadron:v0.5.1-standard-arm64-rpi4-v4.2.0-k3sv1.36.3+k3s1
+FROM quay.io/kairos/hadron:v0.5.1-standard-arm64-rpi4-v4.2.0-k3s-v1.36.3-k3s1
 
 # Add customizations below. Hadron is Alpine-based, so use apk.
 # Example:
