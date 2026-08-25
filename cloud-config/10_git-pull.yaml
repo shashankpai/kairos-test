@@ -7,13 +7,15 @@
 # build/cloud-config.yaml) must ALSO contain this stages.boot.git entry, because
 # the Pi cannot pull this file until the pull is already configured.
 #
-# If this repo is PRIVATE, add an `auth:` block with a GitHub deploy key to the
+# The repo is public, so we use HTTPS (no auth needed). Kairos's golang-native
+# git can clone public repos over HTTPS without any credentials.
+# If the repo were PRIVATE, add an `auth:` block with a GitHub deploy key to the
 # flash-time copy only (never commit the private key). See docs/01-flashing.md.
 
 stages:
   boot:
     - name: "Pull config repo"
       git:
-        url: "git@github.com:shashankpai/kairos-test.git"
+        url: "https://github.com/shashankpai/kairos-test.git"
         path: "/oem/cloud-config-files"
         branch: "main"

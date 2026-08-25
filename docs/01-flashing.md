@@ -39,7 +39,7 @@ stages:
   boot:
     - name: "Pull config repo"
       git:
-        url: "git@github.com:shashankpai/kairos-test.git"
+        url: "https://github.com/shashankpai/kairos-test.git"
         path: "/oem/cloud-config-files"
         branch: "main"
 ```
