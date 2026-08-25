@@ -12,9 +12,6 @@ name: Build and publish Kairos Pi image
 on:
   push:
     branches: [main]
-    paths:
-      - 'image/**'
-      - '.github/workflows/build-and-publish.yaml'
     tags: ['v*']
   workflow_dispatch:
 
