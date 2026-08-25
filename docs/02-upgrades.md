@@ -79,6 +79,23 @@ If the active system boots but is broken in a subtler way (services won't start,
      ```
 3. Reboot into the restored active system.
 
+## Verified upgrade record
+
+### v0.1.0 (sha-30630bc) — first custom image upgrade
+
+- **Date:** 2026-08-25
+- **Source image:** `ghcr.io/shashankpai/kairos-pi:sha-30630bc`
+- **Base image:** `quay.io/kairos/hadron:v0.5.1-standard-arm64-rpi4-v4.2.0-k3s-v1.36.3-k3s1`
+- **Pi:** Raspberry Pi 4, USB pen drive ~64 GB, static IP `192.168.1.34`
+- **Result:** Success
+  - `KAIROS_TEST_VERSION=sha-30630bc3cf2fd1334afd54358c01414322cbf2e9` confirmed in `/etc/os-release`
+  - k3s node `Ready`, all system pods running
+  - Boot-time config pull (curl+tar) working — `/oem/cloud-config-files/` populated
+- **Notes:**
+  - Hadron v0.5.1 is a "nogit" build — the `stages.boot.git` module is unavailable. Used `curl+tar` in `stages.boot.commands` instead (see `cloud-config/10_git-pull.yaml`).
+  - k3s state was reset before the upgrade due to an IP change (DHCP assigned a new IP after reboot). Set static IP via `/etc/systemd/network/10-end0.network` to prevent recurrence.
+  - The upgrade was tested with `:sha-30630bc` (commit-pinned tag). The `:v0.1.0` release tag produces the same image plus a `.raw.gz` flash artifact.
+
 ## Upgrade cadence
 
 This plan uses **manual** upgrades (SSH-triggered). A reasonable cadence:
