@@ -172,6 +172,8 @@ spec:
       labels:
         app: grafana
     spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
       containers:
         - name: grafana
           image: grafana/grafana:11.2.0
@@ -191,7 +193,6 @@ spec:
           ports:
             - containerPort: 3000
               name: web
-              hostPort: 3000
           volumeMounts:
             - name: datasources
               mountPath: /etc/grafana/provisioning/datasources
