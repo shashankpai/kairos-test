@@ -7,6 +7,10 @@
 # same label. This is the Kairos-native best practice for per-node
 # local storage on small edge clusters.
 #
+# IMPORTANT: On Kairos, the rootfs is read-only. /mnt is on the read-only
+# rootfs, so we can't create mount points there. We use /usr/local/ssd
+# instead, which is on the COS_PERSISTENT partition (writable).
+#
 # Why not Longhorn? Longhorn is a distributed block storage system that
 # needs 3+ nodes for quorum and ~1GB RAM overhead. For a 2-Pi edge
 # cluster where each Pi has its own SSD, local-path provisioner + SSD
@@ -19,17 +23,17 @@
 # correct ordering.
 
 write_files:
-  - path: /etc/systemd/system/mnt-ssd.mount
+  - path: /etc/systemd/system/usr-local-ssd.mount
     permissions: 0644
     content: |
       [Unit]
-      Description=Mount USB SSD at /mnt/ssd
+      Description=Mount USB SSD at /usr/local/ssd
       After=local-fs.target
       Before=k3s.service
 
       [Mount]
       What=LABEL=kairos-ssd
-      Where=/mnt/ssd
+      Where=/usr/local/ssd
       Type=ext4
       Options=defaults,noatime
 
@@ -40,12 +44,12 @@ write_files:
     content: |
       [Unit]
       Description=Bind-mount k3s storage to SSD
-      Requires=mnt-ssd.mount
-      After=mnt-ssd.mount
+      Requires=usr-local-ssd.mount
+      After=usr-local-ssd.mount
       Before=k3s.service
 
       [Mount]
-      What=/mnt/ssd/k3s-storage
+      What=/usr/local/ssd/k3s-storage
       Where=/var/lib/rancher/k3s/storage
       Type=none
       Options=bind
@@ -58,16 +62,16 @@ stages:
     - name: "Set up SSD storage"
       commands:
         - |
-          # Create mount points
-          mkdir -p /mnt/ssd /mnt/ssd/k3s-storage
+          # Create mount points on the persistent partition (rootfs is read-only)
+          mkdir -p /usr/local/ssd /usr/local/ssd/k3s-storage
           # Create k3s storage directory if it doesn't exist (needed for bind-mount)
           mkdir -p /var/lib/rancher/k3s/storage
           # Reload systemd to pick up the new mount units
           systemctl daemon-reload
           # Enable the mount units so they persist across reboots
-          systemctl enable mnt-ssd.mount
+          systemctl enable usr-local-ssd.mount
           systemctl enable var-lib-rancher-k3s\\x2dstorage.mount
           # Mount now if not already mounted
-          mountpoint -q /mnt/ssd || systemctl start mnt-ssd.mount
+          mountpoint -q /usr/local/ssd || systemctl start usr-local-ssd.mount
           # Bind-mount k3s storage if not already mounted
           mountpoint -q /var/lib/rancher/k3s/storage || systemctl start var-lib-rancher-k3s\\x2dstorage.mount
