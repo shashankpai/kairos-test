@@ -1,34 +1,27 @@
 #cloud-config
 # Sets a static IP for the Pi via systemd-networkd.
-# Written to /etc/systemd/network/ which persists on the COS_PERSISTENT
-# partition. A more specific [Match] wins over the existing DHCP config.
+# Written to /etc/systemd/network/ which persists via the Kairos
+# overlay (write_files runs at initramfs stage before rootfs is
+# made read-only).
 #
-# Interface: end0 (Pi 4 built-in Ethernet)
+# Interface: end0 (Pi 4 built-in Gigabit Ethernet)
 # IP:        192.168.1.34/24
 # Gateway:   192.168.1.1
-# DNS:       1.1.1.1, 8.8.8.8
+# DNS:       192.168.1.1 (router), 8.8.8.8 (fallback)
 #
-# To use a different IP for Pi 2, override just this file in its OEM config.
+# For Pi 2, create a separate OEM config that overwrites this file
+# with its own IP address.
 
 write_files:
-  - path: /etc/systemd/network/10-end0-static.network
-    permissions: "0644"
+  - path: /etc/systemd/network/10-end0.network
+    permissions: "0600"
     content: |
       [Match]
       Name=end0
 
       [Network]
+      DHCP=no
       Address=192.168.1.34/24
       Gateway=192.168.1.1
-      DNS=1.1.1.1
+      DNS=192.168.1.1
       DNS=8.8.8.8
-      LinkLocalAddressing=no
-
-stages:
-  network:
-    - name: "Apply static IP for end0"
-      commands:
-        - |
-          # Reload networkd so the new config takes effect immediately
-          # (write_files runs at initramfs stage, this ensures it's live)
-          systemctl restart systemd-networkd 2>/dev/null || true
