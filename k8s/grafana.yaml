@@ -184,6 +184,8 @@ spec:
               value: ""
             - name: GF_SERVER_SERVE_FROM_SUB_PATH
               value: "false"
+            - name: GF_SERVER_ENABLE_GZIP
+              value: "true"
           ports:
             - containerPort: 3000
               name: web
