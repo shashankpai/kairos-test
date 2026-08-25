@@ -140,6 +140,18 @@ stages:
           systemctl start usr-local-ssd.mount
 
           echo "SSD formatted and mounted at /usr/local/ssd"
+
+          # Configure k3s to use the SSD for ALL its data (container image layers,
+          # etcd, TLS certs, PVC storage). This is the key performance fix:
+          # containerd's overlay filesystem for container images lives here, so
+          # static files (JS/CSS) are served from fast SSD I/O, not the pen drive.
+          # Only written after the SSD is confirmed mounted.
+          mkdir -p /etc/rancher/k3s /usr/local/ssd/k3s-data
+          if ! grep -q "data-dir" /etc/rancher/k3s/config.yaml 2>/dev/null; then
+            cat >> /etc/rancher/k3s/config.yaml << 'EOCONF'
+data-dir: /usr/local/ssd/k3s-data
+EOCONF
+          fi
   network:
     - name: "Configure local-path provisioner to use SSD"
       commands:
