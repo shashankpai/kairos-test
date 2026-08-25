@@ -1,0 +1,34 @@
+#cloud-config
+# Applies k8s manifests from the pulled repo to the k3s cluster.
+#
+# Uses the Kairos-native stage pattern:
+# - network stage: applies manifests once k3s is up (after every boot)
+# - reconcile stage: re-applies every 60 min to correct drift
+#
+# The k8s/ directory is downloaded to /oem/cloud-config-files/k8s/ by
+# the curl+tar pull in 10_git-pull.yaml. This stage applies those
+# manifests to the cluster, providing GitOps-style reconciliation
+# without needing Flux or any extra controller.
+stages:
+  network:
+    - name: "Apply k8s workloads"
+      commands:
+        - |
+          set -e
+          # Wait for k3s API to be ready (up to 5 minutes)
+          for i in $(seq 1 60); do
+            if sudo k3s kubectl get nodes >/dev/null 2>&1; then break; fi
+            sleep 5
+          done
+          # Apply all manifests from the pulled repo
+          if [ -d /oem/cloud-config-files/k8s ]; then
+            sudo k3s kubectl apply -f /oem/cloud-config-files/k8s/
+          fi
+  reconcile:
+    - name: "Reconcile k8s workloads"
+      commands:
+        - |
+          set -e
+          if [ -d /oem/cloud-config-files/k8s ]; then
+            sudo k3s kubectl apply -f /oem/cloud-config-files/k8s/
+          fi
