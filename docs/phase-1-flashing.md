@@ -3,17 +3,17 @@
 How to provision a Raspberry Pi 4 from scratch — from a stock Kairos hadron image to a
 running k3s node with a static IP, SSD-backed storage, and self-updating config from GitHub.
 
-This document covers both Pi 1 (k3s server) and Pi 2 (k3s agent).
+This document covers Pi 1 (k3s server). Pi 2 (agent) will be added in a later phase.
 
 ---
 
 ## Prerequisites
 
-- Raspberry Pi 4 (arm64), one or two.
-- USB pen drive (~64 GB) to boot from — one per Pi.
-- USB SSD connected to the Pi — one per Pi. The SSD is auto-detected, formatted, and mounted
-  by `cloud-config/05_ssd_storage.yaml` on first boot.
-- A Linux/Mac host with Docker and `dd`.
+- Raspberry Pi 4 (arm64).
+- USB pen drive (~64 GB) to boot from.
+- USB SSD connected to the Pi. Auto-detected, formatted, and mounted by
+  `cloud-config/05_ssd_storage.yaml` on first boot.
+- A Mac (or Linux) host with Docker and `dd`.
 - The Kairos base image tag:
   `quay.io/kairos/hadron:v0.5.1-standard-arm64-rpi4-v4.2.0-k3s-v1.36.3-k3s1`
 
@@ -27,14 +27,10 @@ This document covers both Pi 1 (k3s server) and Pi 2 (k3s agent).
 
 ```
 Pi 1 (192.168.1.34) — k3s server + control plane
-  ├── USB pen drive → Kairos OS (immutable)
+  ├── USB pen drive → Kairos OS (immutable, read-only rootfs)
   └── USB SSD → k3s data (containerd images, etcd, PVCs)
        /usr/local/ssd/k3s-data/       ← all k3s data (containerd layers live here!)
        /usr/local/ssd/k3s-storage/    ← PVC storage (Prometheus data, Grafana DB)
-
-Pi 2 (192.168.1.35) — k3s agent (worker only)
-  ├── USB pen drive → Kairos OS (immutable)
-  └── USB SSD → k3s data (containerd images, PVCs)
 ```
 
 **Why the SSD for k3s data?** Grafana's JS files and all container image layers are served
@@ -223,107 +219,11 @@ sudo k3s kubectl get pods -n monitoring
 > syncing `05_ssd_storage.yaml` and `20_k8s_workloads.yaml` into `/oem/`. On the SECOND
 > boot, the SSD data-dir config is applied and k3s uses the SSD for all data.
 
----
-
-## Pi 2 — k3s agent, 192.168.1.35
-
-### Pre-requisite: get the k3s node token from Pi 1
-
-```bash
-ssh -i ~/.ssh/id_ed25519 kairos@192.168.1.34
-sudo cat /var/lib/rancher/k3s/server/node-token
-# Copy this token — you'll need it below
-```
-
-### Pi 2 flash-time cloud-config
-
-```yaml
-# build/cloud-config-pi2.yaml — Pi 2 (k3s agent/worker)
-# This file is PER-PI and NOT committed to the repo.
-#
-#cloud-config
-users:
-  - name: kairos
-    passwd: "Kairo@987"
-    groups:
-      - admin
-    ssh_authorized_keys:
-      - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHo5qJ/2w3UcBUoRkXPxkv7nbL2OXEhpopROI906HPBY ansible-controller"
-
-k3s-agent:
-  enabled: true
-  env:
-    K3S_URL: "https://192.168.1.34:6443"
-    K3S_TOKEN: "PASTE_TOKEN_FROM_PI1_HERE"
-
-write_files:
-  # Same static IP fix as Pi 1 — override DHCP to exclude end0
-  - path: /etc/systemd/network/20-dhcp.network
-    permissions: "0644"
-    content: |
-      [Match]
-      Name=en* !end0
-
-      [Network]
-      DHCP=yes
-      [DHCP]
-      ClientIdentifier=mac
-
-  # Static IP for Pi 2
-  - path: /etc/systemd/network/99-end0-static.network
-    permissions: "0644"
-    content: |
-      [Match]
-      Name=end0
-
-      [Network]
-      DHCP=no
-      Address=192.168.1.35/24
-      Gateway=192.168.1.1
-      DNS=192.168.1.1
-      DNS=8.8.8.8
-
-  # Git-pull bootstrap (same content as Pi 1)
-  - path: /oem/10_git-pull.yaml
-    permissions: "0644"
-    content: |
-      #cloud-config
-      stages:
-        boot:
-          - name: "Pull config repo and sync cloud-config"
-            commands:
-              - |
-                set -e
-                mkdir -p /oem/cloud-config-files
-                tmpdir=$(mktemp -d)
-                curl -sL "https://github.com/shashankpai/kairos-test/archive/refs/heads/main.tar.gz" -o "$tmpdir/repo.tar.gz"
-                rm -rf /oem/cloud-config-files/*
-                tar xzf "$tmpdir/repo.tar.gz" -C /oem/cloud-config-files/ --strip-components=1
-                rm -rf "$tmpdir"
-                if [ -d /oem/cloud-config-files/cloud-config ]; then
-                  for f in /oem/cloud-config-files/cloud-config/*.yaml; do
-                    [ -f "$f" ] && cp "$f" /oem/
-                  done
-                fi
-```
-
-Build and flash using the same AuroraBoot command, substituting `cloud-config-pi2.yaml`.
-
-Verify Pi 2 joined the cluster:
-```bash
-# From Pi 1:
-sudo k3s kubectl get nodes -o wide
-# Should show both kairos-XXXX nodes: one control-plane, one <none> (agent)
-```
-
----
-
 ## What you have at the end of Phase 1
 
 - **Pi 1**: k3s server at 192.168.1.34, static IP, SSD-backed k3s data
-- **Pi 2**: k3s agent at 192.168.1.35, static IP, SSD-backed k3s data
-- Both Pis self-update cloud-config from GitHub on every boot
-- Monitoring stack (Grafana, Prometheus, node-exporter, kube-state-metrics) deployed on Pi 1
+- Self-updating cloud-config from GitHub on every boot
+- Monitoring stack (Grafana, Prometheus, node-exporter, kube-state-metrics) deployed
 
 ---
 
