@@ -49,8 +49,8 @@ So it takes two boots to fully activate the SSD:
 
 ## Step 1: Write the flash-time cloud-config on the controller
 
-The flash-time config is **per-Pi** and is **not committed to this repo** (it contains a
-password). Create it directly on the Ubuntu controller machine:
+The flash-time config is **per-Pi** and is **not committed to this repo**. Create it
+directly on the Ubuntu controller machine:
 
 ```bash
 mkdir -p ~/kairos-flash
@@ -58,7 +58,6 @@ cat > ~/kairos-flash/cloud-config-pi1.yaml << 'EOF'
 #cloud-config
 users:
   - name: kairos
-    passwd: "Kairo@987"
     groups:
       - admin
     ssh_authorized_keys:
