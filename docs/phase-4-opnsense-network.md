@@ -219,11 +219,58 @@ Port 5: PVID 1
 
 ### 2.3 Verify
 
+After creating VLAN 10 and editing VLAN 1, the VLAN table should look like:
+
 ```
-Save configuration
-Check VLAN → VLAN Table:
-  VLAN 1:  Ports 1(U), 2(T), 5(U)
-  VLAN 10: Ports 2(T), 3(U), 4(U)
+VLAN ID  VLAN Name  Member Ports  Tagged Ports  Untagged Ports
+1        Default    1,2,5         2             1,5
+10       homelab    2-4           2             3-4
+```
+
+### 2.4 Set PVID for each port
+
+Navigate to **802.1Q PVID Setting** (separate page from VLAN membership).
+
+The PVID tells the switch which VLAN to assign when untagged traffic enters a port.
+By default all ports will show PVID 1 — you need to change Ports 3 and 4 to PVID 10.
+
+Set each port:
+
+| Port | PVID | Why |
+|------|------|-----|
+| 1 | 1 | Extender traffic → VLAN 1 (leave as default) |
+| 2 | 1 | Trunk port default (leave as default — Proxmox handles tagging) |
+| 3 | 10 | **Change from 1 to 10** — Pi traffic → VLAN 10 |
+| 4 | 10 | **Change from 1 to 10** — Ubuntu traffic → VLAN 10 |
+| 5 | 1 | Mercury switch traffic → VLAN 1 (leave as default) |
+
+After applying, the PVID table should look like:
+
+```
+Port 1: PVID 1
+Port 2: PVID 1
+Port 3: PVID 10
+Port 4: PVID 10
+Port 5: PVID 1
+```
+
+### 2.5 Final verification
+
+The switch is fully configured when both tables match:
+
+**VLAN membership:**
+```
+VLAN 1:  Ports 1(U), 2(T), 5(U)
+VLAN 10: Ports 2(T), 3(U), 4(U)
+```
+
+**PVID:**
+```
+Port 1: PVID 1
+Port 2: PVID 1
+Port 3: PVID 10
+Port 4: PVID 10
+Port 5: PVID 1
 ```
 
 ### Port assignment summary
@@ -320,23 +367,9 @@ Devices don't "know" about VLANs — the switch handles it:
 7. Response comes back the same way in reverse
 ```
 
-#### PVID (Port VLAN ID)
-
-The PVID tells the switch: "when untagged traffic comes IN on this port, which VLAN
-should I tag it as?" This is separate from the VLAN membership table — you need both
-set correctly.
-
-| Port | PVID | Why |
-|------|------|-----|
-| 1 | 1 | Extender traffic → VLAN 1 |
-| 2 | 1 | Trunk port default (Proxmox handles tagging) |
-| 3 | 10 | Pi traffic → VLAN 10 |
-| 4 | 10 | Ubuntu traffic → VLAN 10 |
-| 5 | 1 | Mercury switch traffic → VLAN 1 |
-
-Some TP-Link switches auto-set PVID based on the untagged VLAN membership. Verify in
-the **802.1Q PVID Setting** page that Ports 3 and 4 show PVID 10. If they show PVID 1,
-change them manually.
+Some TP-Link switches auto-set PVID based on the untagged VLAN membership, but the
+SG105E requires manual PVID configuration. Verify in the **802.1Q PVID Setting** page
+that Ports 3 and 4 show PVID 10 (see Step 2.4 above).
 
 ---
 
