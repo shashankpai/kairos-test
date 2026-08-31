@@ -13,7 +13,7 @@ Main router (192.168.1.1, ZTE, home DHCP)
   └── WiFi → Range extender (1 RJ45 port, repeater mode)
                │
                └── Mercury 8-port unmanaged switch
-                     ├── Proxmox 1 (192.168.1.78)
+                     ├── Proxmox 1 (192.168.1.48)
                      ├── Proxmox 2 (192.168.1.x)
                      ├── Proxmox 3 (192.168.1.x)
                      ├── Proxmox 4 (192.168.1.x)
@@ -37,8 +37,8 @@ Main router (192.168.1.1, ZTE — unchanged)
                └── 5-port managed switch (TP-Link SG105E, 802.1Q VLAN)
                      ├── Port 1: VLAN 1 → extender uplink
                      ├── Port 2: Trunk (VLAN 1+10) → Proxmox 1
-                     │     ├── vmbr0 (VLAN 1) → 192.168.1.78 (existing VMs, management)
-                     │     ├── vmbr1 (VLAN 10) → 10.0.0.78 (homelab management)
+                     │     ├── vmbr0 (VLAN 1) → 192.168.1.48 (existing VMs, management)
+                     │     ├── vmbr1 (VLAN 10) → 10.0.0.48 (homelab management)
                      │     └── OPNsense VM
                      │           ├── WAN: vmbr0 → 192.168.1.x (from home router)
                      │           └── LAN: vmbr1 → 10.0.0.1 (homelab DHCP)
@@ -278,7 +278,7 @@ Port 5: PVID 1
 | Port | PVID | Untagged | Tagged | Connected to |
 |------|------|----------|--------|-------------|
 | 1 | 1 | VLAN 1 | — | Extender uplink (home network) |
-| 2 | 1 | — | VLAN 1, VLAN 10 | Proxmox 1 (trunk — carries both VLANs) |
+| 2 | 1 | VLAN 1 | VLAN 10 | Proxmox 1 (trunk — VLAN 1 native, VLAN 10 tagged) |
 | 3 | 10 | VLAN 10 | — | Pi 1 (homelab) |
 | 4 | 10 | VLAN 10 | — | Ubuntu controller (homelab) |
 | 5 | 1 | VLAN 1 | — | Mercury switch (Proxmox 2,3,4 — home network) |
@@ -309,12 +309,11 @@ Devices don't "know" about VLANs — the switch handles it:
 - Traffic comes in untagged from the extender → switch tags it as VLAN 1 internally
 - This is how the homelab reaches the internet: VLAN 10 → OPNsense → VLAN 1 → Port 1 → extender → home router → internet
 
-**Port 2 — Tagged on both VLAN 1 and VLAN 10 (TRUNK)**
+**Port 2 — Untagged on VLAN 1, Tagged on VLAN 10 (TRUNK)**
 - Connected to: Proxmox 1
 - This is the special port — it carries BOTH VLANs simultaneously
-- Proxmox receives tagged traffic and sorts it:
-  - VLAN 1 tags → vmbr0 → 192.168.1.x (home network, existing VMs, management)
-  - VLAN 10 tags → vmbr1 → 10.0.0.x (homelab, OPNsense LAN)
+- VLAN 1 is untagged (native) — Proxmox's `vmbr0` receives it as plain Ethernet
+- VLAN 10 is tagged — Proxmox's `vmbr0.10` sub-interface picks it up and feeds `vmbr1`
 - One physical cable, two networks — Proxmox handles the separation internally
 
 **Port 3 — Untagged on VLAN 10 only**
@@ -375,35 +374,150 @@ that Ports 3 and 4 show PVID 10 (see Step 2.4 above).
 
 ## Step 3: Create vmbr1 on Proxmox 1
 
-SSH to Proxmox 1 (still at 192.168.1.78, still on Mercury switch — no cable changes yet):
+SSH to Proxmox 1 (at 192.168.1.48):
 
 ```bash
-ssh root@192.168.1.78
+ssh root@192.168.1.48
 ```
 
-Backup and edit `/etc/network/interfaces`:
+### 3.1 Find the physical NIC name
 
 ```bash
-cp /etc/network/interfaces /etc/network/interfaces.backup
+ip link show | grep -E "^[0-9]+: (en|eth)" | grep -v "vmbr"
+```
 
-cat >> /etc/network/interfaces << 'EOF'
+On our Proxmox 1, the physical NIC is `eno1` (enslaved to `vmbr0`).
 
-# Homelab VLAN 10 bridge
-auto vmbr1
-iface vmbr1 inet static
-    address 10.0.0.78/24
-    bridge-ports enp3s0
+### 3.2 View the current network config
+
+```bash
+cat /etc/network/interfaces
+```
+
+Before changes, it should look like:
+
+```
+auto lo
+iface lo inet loopback
+
+iface eno1 inet manual
+
+auto vmbr0
+iface vmbr0 inet static
+    address 192.168.1.48/24
+    gateway 192.168.1.1
+    bridge-ports eno1
     bridge-stp off
     bridge-fd 0
-    bridge-vlan-aware yes
-    bridge-vids 10
+
+iface wlp6s0 inet manual
+```
+
+### 3.3 Add VLAN 10 sub-interface and bridge
+
+We use a **VLAN sub-interface** approach (`vmbr0.10`) instead of directly bridging
+the physical NIC. This is the safest method — `vmbr0` stays completely untouched,
+existing VMs are unaffected.
+
+```bash
+# Backup first
+cp /etc/network/interfaces /etc/network/interfaces.backup
+
+# Add VLAN 10 sub-interface and homelab bridge
+cat >> /etc/network/interfaces << 'EOF'
+
+# VLAN 10 sub-interface for homelab
+auto vmbr0.10
+iface vmbr0.10 inet manual
+
+# Homelab bridge (VLAN 10)
+auto vmbr1
+iface vmbr1 inet static
+    address 10.0.0.48/24
+    bridge-ports vmbr0.10
+    bridge-stp off
+    bridge-fd 0
 EOF
 ```
 
-**Do NOT apply yet.** We'll apply after the cable swap.
+### 3.4 Verify the file looks correct
 
-> **Note:** Replace `enp3s0` with your actual physical NIC name. Check with `ip link` on
-> Proxmox 1.
+```bash
+cat /etc/network/interfaces
+```
+
+Should show the original config plus the new VLAN 10 section at the bottom.
+
+### 3.5 Apply the new config
+
+```bash
+ifreload -a
+```
+
+If `ifreload` is not available:
+```bash
+systemctl restart networking
+```
+
+### 3.6 Verify both bridges are up
+
+```bash
+ip addr show vmbr0 | grep inet
+ip addr show vmbr1 | grep inet
+```
+
+Expected output:
+```
+    inet 192.168.1.48/24 scope global vmbr0     ← home network (unchanged)
+    inet 10.0.0.48/24 scope global vmbr1        ← homelab network (new)
+```
+
+Also verify the Proxmox web UI is still accessible at `https://192.168.1.48:8006`
+and existing VMs are still reachable — they should be completely unaffected.
+
+### How the VLAN sub-interface works
+
+```
+Physical NIC (eno1) — one cable to switch Port 2 (trunk)
+  │
+  └── vmbr0 (bridge) — handles ALL traffic from the physical NIC
+        │
+        ├── Untagged traffic → 192.168.1.48 (home network)
+        │   └── Proxmox management, existing VMs, internet — all unchanged
+        │
+        └── vmbr0.10 (VLAN sub-interface) — filters out ONLY VLAN 10 tagged traffic
+              │
+              └── vmbr1 (bridge) — 10.0.0.48 (homelab network)
+                    └── OPNsense VM's LAN interface connects here
+```
+
+**Why this approach is safe:**
+- `vmbr0` is untouched — existing VMs don't notice anything changed
+- `vmbr0.10` only filters VLAN 10 tagged traffic — doesn't affect untagged/VLAN 1 traffic
+- `vmbr1` is a new bridge — only OPNsense and future homelab VMs use it
+- One physical cable — no additional hardware needed
+- Proxmox is reachable on both networks: `192.168.1.48` (home) and `10.0.0.48` (homelab)
+
+**What OPNsense will use:**
+```
+OPNsense VM:
+  ├── net0 → vmbr0 (WAN) → gets 192.168.1.x from home router DHCP
+  └── net1 → vmbr1 (LAN) → 10.0.0.1, serves DHCP to homelab devices
+```
+
+### Important: switch Port 2 must have VLAN 1 untagged
+
+For the VLAN sub-interface approach to work, the switch trunk port (Port 2) must
+have VLAN 1 as **untagged** (not tagged). This is because `vmbr0` is a standard
+bridge that expects untagged traffic. Only VLAN 10 is tagged on Port 2.
+
+```
+VLAN 1:  Port 2 = Untagged (native VLAN — vmbr0 handles this)
+VLAN 10: Port 2 = Tagged (vmbr0.10 picks this up)
+```
+
+If VLAN 1 were tagged on Port 2, Proxmox's `vmbr0` would not understand the tagged
+traffic and would lose network access.
 
 ---
 
@@ -421,7 +535,7 @@ wget https://mirror.opnsense.org/releases/24.7/OPNsense-24.7-dvd-amd64.iso
 
 ## Step 5: Create OPNsense VM (don't start yet)
 
-In Proxmox 1 web UI (https://192.168.1.78:8006):
+In Proxmox 1 web UI (https://192.168.1.48:8006):
 
 ```
 Create VM:
@@ -484,15 +598,15 @@ Managed switch:
 Proxmox 1 is now on the trunk port. Apply the vmbr1 config:
 
 ```bash
-# SSH to Proxmox 1 (still reachable at 192.168.1.78 via VLAN 1 on trunk)
-ssh root@192.168.1.78
+# SSH to Proxmox 1 (still reachable at 192.168.1.48 via VLAN 1 on trunk)
+ssh root@192.168.1.48
 
 # Apply the new bridge config
 ifreload -a
 
 # Verify
-ip addr show vmbr0    # should have 192.168.1.78
-ip addr show vmbr1    # should have 10.0.0.78
+ip addr show vmbr0    # should have 192.168.1.48
+ip addr show vmbr1    # should have 10.0.0.48
 ```
 
 If `ifreload` is not available:
@@ -527,11 +641,11 @@ At the OPNsense console (in Proxmox UI):
 
 ## Step 7: OPNsense Web UI Configuration
 
-From Proxmox 1 (which has 10.0.0.78 on vmbr1):
+From Proxmox 1 (which has 10.0.0.48 on vmbr1):
 
 ```bash
 # SSH tunnel from Mac through Proxmox 1:
-ssh -L 8443:10.0.0.1:443 root@192.168.1.78
+ssh -L 8443:10.0.0.1:443 root@192.168.1.48
 # Then open https://localhost:8443 on Mac
 ```
 
@@ -630,13 +744,13 @@ System → Settings → Administration:
 ssh kairos@10.0.0.34                    # SSH to Pi — should work
 ping 10.0.0.1                           # OPNsense — should work
 ping 8.8.8.8                            # Internet — should work (routed through OPNsense)
-ping 192.168.1.78                       # Proxmox 1 — should work (routed to VLAN 1)
+ping 192.168.1.48                       # Proxmox 1 — should work (routed to VLAN 1)
 
 # From Mac (192.168.1.6):
 ssh -i ~/.ssh/id_ed25519 kairos@10.0.0.34   # Should work (WAN firewall rule)
 https://10.0.0.1                             # OPNsense UI (WAN firewall rule)
 
-# From Proxmox 1 (192.168.1.78):
+# From Proxmox 1 (192.168.1.48):
 ssh kairos@10.0.0.34                    # Should work (Proxmox has both VLANs)
 
 # Verify Proxmox 2,3,4 unchanged:
@@ -696,7 +810,7 @@ OPNsense UI → System → Configuration → Backups:
 1. Unplug everything from managed switch
 2. Plug everything back into Mercury switch (original config)
 3. Remove vmbr1 from Proxmox 1:
-   ssh root@192.168.1.78
+   ssh root@192.168.1.48
    # Remove vmbr1 block from /etc/network/interfaces
    ifreload -a
 4. Stop OPNsense VM
@@ -712,7 +826,7 @@ OPNsense UI → System → Configuration → Backups:
 4. If vmbr0 has no IP, the trunk port config is wrong
 5. Move Proxmox 1 cable to Port 1 (VLAN 1 only, not trunk)
 6. Reboot Proxmox 1
-7. It should come back at 192.168.1.78
+7. It should come back at 192.168.1.48
 8. Fix switch trunk port config and retry
 ```
 
