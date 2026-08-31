@@ -246,6 +246,98 @@ Devices don't "know" about VLANs — the switch handles it:
 - **Tagged/trunk port** (2): Carries multiple VLANs with tags intact. Proxmox sorts
   traffic by VLAN tag into different virtual bridges (vmbr0 for VLAN 1, vmbr1 for VLAN 10).
 
+### VLAN explanation: what we configured and why
+
+#### The two VLANs
+
+| VLAN | Name | Subnet | Purpose |
+|------|------|--------|---------|
+| 1 | Default (home) | 192.168.1.x | Existing home network — internet, phones, TV, existing Proxmox VMs |
+| 10 | homelab | 10.0.0.x | New isolated network for Pi, Ubuntu controller, and future homelab VMs |
+
+#### Port-by-port breakdown
+
+**Port 1 — Untagged on VLAN 1**
+- Connected to: range extender (uplink to home router / internet)
+- Traffic comes in untagged from the extender → switch tags it as VLAN 1 internally
+- This is how the homelab reaches the internet: VLAN 10 → OPNsense → VLAN 1 → Port 1 → extender → home router → internet
+
+**Port 2 — Tagged on both VLAN 1 and VLAN 10 (TRUNK)**
+- Connected to: Proxmox 1
+- This is the special port — it carries BOTH VLANs simultaneously
+- Proxmox receives tagged traffic and sorts it:
+  - VLAN 1 tags → vmbr0 → 192.168.1.x (home network, existing VMs, management)
+  - VLAN 10 tags → vmbr1 → 10.0.0.x (homelab, OPNsense LAN)
+- One physical cable, two networks — Proxmox handles the separation internally
+
+**Port 3 — Untagged on VLAN 10 only**
+- Connected to: Pi 1
+- Pi sends/receives plain Ethernet (no VLAN tags — Pi doesn't know VLANs exist)
+- Switch silently tags all Port 3 traffic as VLAN 10
+- Pi will get 10.0.0.34 from OPNsense's DHCP server
+
+**Port 4 — Untagged on VLAN 10 only**
+- Connected to: Ubuntu controller
+- Same as Port 3 — Ubuntu doesn't know about VLANs
+- Switch tags all traffic as VLAN 10
+- Ubuntu will get 10.0.0.32 from OPNsense's DHCP server
+
+**Port 5 — Untagged on VLAN 1 only**
+- Connected to: Mercury unmanaged switch (which has Proxmox 2, 3, 4)
+- All traffic on this port is VLAN 1 (home network)
+- Proxmox 2, 3, 4 stay on 192.168.1.x — completely unchanged
+
+#### The key concept: Tagged vs Untagged vs Not Member
+
+| Term | Meaning | Where used |
+|------|---------|-----------|
+| **Untagged** | Switch adds/strips VLAN tag silently. Device sees normal network. | End devices (Pi, Ubuntu, extender, Mercury) |
+| **Tagged** | Switch keeps VLAN tags in the packet. Device must understand VLANs. | Trunk ports (Proxmox — it sorts by tag) |
+| **Not Member** | Port doesn't participate in this VLAN at all. | Ports 3,4 not on VLAN 1; Ports 1,5 not on VLAN 10 |
+
+#### Traffic flow example: Pi requesting an IP
+
+```
+1. Pi powers on → sends DHCP request (plain Ethernet, no VLAN tag)
+2. Switch Port 3 receives it → tags it as VLAN 10 internally
+3. Switch forwards to Port 2 (the only other VLAN 10 member) with VLAN 10 tag
+4. Proxmox NIC receives it → vmbr1 (VLAN 10) → OPNsense LAN interface sees it
+5. OPNsense responds: "Your IP is 10.0.0.34" (sends with VLAN 10 tag)
+6. Proxmox → Port 2 → switch forwards to Port 3 with VLAN 10 tag
+7. Switch Port 3 strips the tag → sends to Pi as plain Ethernet
+8. Pi receives: "Your IP is 10.0.0.34" — Pi has no idea VLANs were involved
+```
+
+#### Traffic flow example: Pi reaching the internet
+
+```
+1. Pi (10.0.0.34) sends packet to 8.8.8.8
+2. Switch tags as VLAN 10 → forwards to Port 2 → Proxmox → vmbr1 → OPNsense LAN
+3. OPNsense routes: VLAN 10 (LAN) → VLAN 1 (WAN)
+4. OPNsense sends out on vmbr0 → Proxmox → Port 2 (tagged VLAN 1)
+5. Switch forwards VLAN 1 to Port 1 (extender) → strips tag
+6. Extender → home router → internet
+7. Response comes back the same way in reverse
+```
+
+#### PVID (Port VLAN ID)
+
+The PVID tells the switch: "when untagged traffic comes IN on this port, which VLAN
+should I tag it as?" This is separate from the VLAN membership table — you need both
+set correctly.
+
+| Port | PVID | Why |
+|------|------|-----|
+| 1 | 1 | Extender traffic → VLAN 1 |
+| 2 | 1 | Trunk port default (Proxmox handles tagging) |
+| 3 | 10 | Pi traffic → VLAN 10 |
+| 4 | 10 | Ubuntu traffic → VLAN 10 |
+| 5 | 1 | Mercury switch traffic → VLAN 1 |
+
+Some TP-Link switches auto-set PVID based on the untagged VLAN membership. Verify in
+the **802.1Q PVID Setting** page that Ports 3 and 4 show PVID 10. If they show PVID 1,
+change them manually.
+
 ---
 
 ## Step 3: Create vmbr1 on Proxmox 1
