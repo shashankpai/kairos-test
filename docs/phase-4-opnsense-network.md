@@ -523,133 +523,257 @@ traffic and would lose network access.
 
 ## Step 4: Download OPNsense ISO
 
-```bash
-# On Proxmox 1, download OPNsense DVD ISO
-cd /var/lib/vz/template/iso
-wget https://mirror.opnsense.org/releases/24.7/OPNsense-24.7-dvd-amd64.iso
-```
+The ISO download from Proxmox 1 failed because DNS was not resolving
+(`mirror.opnsense.org` could not be resolved). Internet worked (ping to
+8.8.8.8 succeeded), but DNS was broken.
 
-(Use the latest stable version from https://opnsense.org/download/)
+### 4.1 Download on Mac browser
 
----
+Go to https://opnsense.org/download/ and select:
+- **Image type:** DVD image (amd64)
+- **Mirror:** any mirror
 
-## Step 5: Create OPNsense VM (don't start yet)
+The download is a `.bz2` compressed file (~1.5GB compressed).
 
-In Proxmox 1 web UI (https://192.168.1.48:8006):
-
-```
-Create VM:
-  General:
-    Name: opnsense
-    VM ID: (next available)
-  OS:
-    ISO: OPNsense-24.7-dvd-amd64.iso
-    Type: Linux 6.x
-  System:
-    Machine: q35
-    BIOS: OVMF (UEFI)
-    EFI Disk: yes
-  Disks:
-    Storage: local-lvm (or your preferred)
-    Size: 16 GB
-    Discard: yes (if SSD)
-  CPU:
-    Cores: 2
-    Type: host
-  Memory:
-    Memory: 2048 MB
-  Network:
-    net0: bridge=vmbr0, vlan=1, model=virtio   ← WAN (home network)
-    net1: bridge=vmbr1, vlan=10, model=virtio  ← LAN (homelab)
-```
-
-**Do NOT start the VM yet.** Start it after the cable swap.
-
----
-
-## Step 6: Switch Swap + OPNsense Boot
-
-### 6.1 Shutdown homelab devices
+### 4.2 Decompress on Mac
 
 ```bash
-# From Ubuntu controller, shutdown Pi 1 gracefully
-ssh kairos@<pi-ip>
-sudo poweroff
-
-# Shutdown Ubuntu controller
-sudo poweroff
+cd ~/Downloads
+bunzip2 OPNsense-26.7-dvd-amd64.iso.bz2
+# This produces OPNsense-26.7-dvd-amd64.iso
+ls -lh OPNsense-26.7-dvd-amd64.iso
 ```
 
-### 6.2 Swap switches
+### 4.3 Upload to Proxmox 1 via web UI
 
-```
-Physical cable changes:
+1. Open `https://192.168.1.48:8006` in Mac browser
+2. Select node `pve` in the left panel
+3. Click **local** storage
+4. Click **ISO Images** tab
+5. Click **Upload** button
+6. Select the `.iso` file from Downloads
+7. Wait for upload to complete
 
-Managed switch:
-  Port 1 ← extender (was: Mercury Port 1)
-  Port 2 ← Proxmox 1 (was: Mercury Port X)
-  Port 3 ← Pi 1 (was: Mercury Port Y)
-  Port 4 ← Ubuntu (was: Mercury Port Z)
-  Port 5 ← Mercury switch uplink (Mercury still has Proxmox 2,3,4)
-```
-
-### 6.3 Apply new network config on Proxmox 1
-
-Proxmox 1 is now on the trunk port. Apply the vmbr1 config:
+### 4.4 Verify on Proxmox 1
 
 ```bash
-# SSH to Proxmox 1 (still reachable at 192.168.1.48 via VLAN 1 on trunk)
-ssh root@192.168.1.48
-
-# Apply the new bridge config
-ifreload -a
-
-# Verify
-ip addr show vmbr0    # should have 192.168.1.48
-ip addr show vmbr1    # should have 10.0.0.48
-```
-
-If `ifreload` is not available:
-```bash
-systemctl restart networking
-```
-
-### 6.4 Start OPNsense VM
-
-```
-Proxmox UI → opnsense VM → Start
-Open VM console (Proxmox UI → Console)
-```
-
-### 6.5 OPNsense initial setup (via VM console)
-
-At the OPNsense console (in Proxmox UI):
-
-```
-1. Login: installer / opnsense
-2. Install OPNsense to disk (accept defaults)
-3. After install, reboot (remove ISO)
-4. At console, login: root / opnsense
-5. Assign interfaces:
-   WAN  → vtnet0 (first NIC, connected to vmbr0/VLAN 1)
-   LAN  → vtnet1 (second NIC, connected to vmbr1/VLAN 10)
-6. Set LAN IP: 10.0.0.1/24
-7. WAN: DHCP (gets 192.168.1.x from home router)
+ls -lh /var/lib/vz/template/iso/OPNsense*.iso
+# Should show: /var/lib/vz/template/iso/OPNsense-26.7-dvd-amd64.iso
 ```
 
 ---
 
-## Step 7: OPNsense Web UI Configuration
+## Step 5: Create OPNsense VM
 
-From Proxmox 1 (which has 10.0.0.48 on vmbr1):
+### 5.1 Check available VM IDs
 
 ```bash
-# SSH tunnel from Mac through Proxmox 1:
-ssh -L 8443:10.0.0.1:443 root@192.168.1.48
-# Then open https://localhost:8443 on Mac
+qm list
 ```
 
-### 7.1 Initial setup wizard
+In our cluster, VM IDs 100, 2002, 300, 9000, 9001 were already taken
+(9001 was on a stale node `pve6` that is no longer part of the cluster
+but still blocks the ID). We used **9002**.
+
+### 5.2 Create the VM
+
+```bash
+qm create 9002 \
+  --name opnsense \
+  --ostype other \
+  --machine q35 \
+  --bios ovmf \
+  --cpu host \
+  --cores 2 \
+  --memory 2048 \
+  --net0 virtio,bridge=vmbr0 \
+  --net1 virtio,bridge=vmbr1 \
+  --scsihw virtio-scsi-single \
+  --scsi0 local-lvm:16 \
+  --cdrom local:iso/OPNsense-26.7-dvd-amd64.iso \
+  --boot order=ide2 \
+  --efidisk0 local-lvm:1
+```
+
+**Notes:**
+- `net0 → vmbr0` = WAN (home network, VLAN 1)
+- `net1 → vmbr1` = LAN (homelab, VLAN 10)
+- 2 cores, 2GB RAM (OPNsense recommends 3GB but 2GB works fine for homelab)
+- 16GB disk on local-lvm
+- OVMF (UEFI) BIOS with EFI disk
+
+### 5.3 Start the VM
+
+```bash
+qm start 9002
+```
+
+Open the Proxmox web UI → VM 9002 → **Console**.
+
+---
+
+## Step 6: Install OPNsense (via VM console)
+
+### 6.1 Boot from DVD (live mode)
+
+The VM boots into OPNsense live mode from the DVD. Login at the console:
+
+```
+Login: root
+Password: opnsense
+```
+
+### 6.2 Launch the installer
+
+The console menu does NOT have an "Install" option by default. To launch
+the installer, type `8` (Shell) and run:
+
+```bash
+/usr/local/sbin/opnsense-installer
+```
+
+### 6.3 Installer steps
+
+1. **Choose task:** Install UFS (simpler for a VM, ZFS is overkill here)
+2. **RAM warning:** It will warn that 2GB is below the recommended 3GB —
+   choose **proceed anyway** (2GB is fine for homelab)
+3. **Keyboard layout:** Select your layout (default US is fine)
+4. **Disk selection:** Select the **hard disk 16GB** (NOT the DVD/CD).
+   It may show as `da0`, `vtbd0`, or `ada0` — pick the ~16GB one.
+5. **Confirm:** Yes, proceed with install
+6. Wait for installation to complete (~2-3 minutes)
+
+### 6.4 Remove ISO before reboot
+
+When installation completes, **do not reboot yet**. From Proxmox SSH:
+
+```bash
+qm stop 9002
+qm set 9002 --ide2 none,media=cdrom
+qm set 9002 --boot order=scsi0
+qm start 9002
+```
+
+This removes the ISO and sets the VM to boot from disk.
+
+### 6.5 First boot from disk
+
+Open the console again. OPNsense boots from disk and shows the console
+menu with options like:
+- Assign interfaces
+- Set interface IP address
+- Reset root password
+- Reset factory defaults
+- Shell
+- pftop
+- Firewall log
+- Reload all services
+- Update from console
+- Restore a backup
+
+---
+
+## Step 7: Assign WAN and LAN interfaces
+
+### 7.1 Assign interfaces (menu option 1)
+
+Type `1` for **Assign interfaces**.
+
+```
+Configure LAGGs now? → n
+Configure VLANs now? → n
+
+WAN interface: vtnet0    ← connected to vmbr0 (home network)
+LAN interface: vtnet1    ← connected to vmbr1 (homelab VLAN 10)
+Optional interface 1:    ← press Enter (blank, none needed)
+Continue? → y
+```
+
+### 7.2 Set LAN IP (menu option 2)
+
+Type `2` for **Set interface IP address**.
+
+```
+Which interface to configure? → 1 (LAN)
+
+Configure IPv4 address LAN interface via DHCP? → n
+  IPv4 address: 10.0.0.1
+  Subnet mask: 24
+  Upstream gateway: press Enter (blank — LAN is the gateway itself)
+
+Configure IPv6 address LAN interface via DHCP6? → n
+New LAN IPv6 address: n
+
+Enable DHCP server on LAN? → y
+  DHCP range start: 10.0.0.100
+  DHCP range end: 10.0.0.200
+
+Revert to HTTP? → n (keep HTTPS)
+Generate self-signed cert for GUI? → y
+Restore GUI access defaults? → y
+```
+
+After this, OPNsense shows:
+```
+You can access the web GUI at https://10.0.0.1
+```
+
+---
+
+## Step 8: Access OPNsense Web UI
+
+The Mac is on `192.168.1.x` (home network) and OPNsense is at `10.0.0.1`
+(homelab VLAN 10) — they can't reach each other directly. We need an SSH
+tunnel through a machine that has access to both networks.
+
+### 8.1 Verify OPNsense is listening
+
+From Proxmox 1 (which has both `192.168.1.48` and `10.0.0.48`):
+
+```bash
+nc -zv 10.0.0.1 443
+# Should show: 10.0.0.1 443 (https) open
+
+curl -k https://10.0.0.1
+# Should return the OPNsense login HTML page
+```
+
+### 8.2 SSH tunnel from Mac
+
+Direct SSH from Mac to Proxmox failed with `Permission denied (publickey,password)`
+because Proxmox had SSH key-only auth configured. The workaround is a
+**double tunnel through the Ubuntu controller**:
+
+**Terminal 1 on Mac** — tunnel to Ubuntu:
+```bash
+ssh -L 9443:localhost:9443 -N arjun@192.168.1.32
+```
+
+**Terminal 2 on Mac** — SSH to Ubuntu, then tunnel to OPNsense via Proxmox:
+```bash
+ssh arjun@192.168.1.32
+ssh -L 9443:10.0.0.1:443 -N root@192.168.1.48
+```
+
+**Open in Mac browser:**
+```
+https://localhost:9443
+```
+
+Accept the certificate warning (Advanced → Proceed anyway).
+
+### 8.3 Login
+
+```
+Username: root
+Password: opnsense
+```
+
+---
+
+## Step 9: OPNsense Web UI Configuration
+
+### 9.1 Initial setup wizard
 
 ```
 Login: root / opnsense
@@ -661,7 +785,7 @@ Run wizard:
   └── WAN: DHCP (already configured)
 ```
 
-### 7.2 Configure DHCP server on LAN
+### 9.2 Configure DHCP server on LAN
 
 ```
 Services → DHCPv4 → LAN:
@@ -671,7 +795,7 @@ Services → DHCPv4 → LAN:
   └── Gateway: 10.0.0.1
 ```
 
-### 7.3 Add DHCP static mappings
+### 9.3 Add DHCP static mappings
 
 ```
 Services → DHCPv4 → LAN → Static Mappings:
@@ -689,7 +813,7 @@ Services → DHCPv4 → LAN → Static Mappings:
     Description: Ubuntu controller
 ```
 
-### 7.4 Configure firewall rules
+### 9.4 Configure firewall rules
 
 ```
 Firewall → Rules → WAN:
@@ -713,7 +837,7 @@ Firewall → Rules → WAN:
     Description: Allow OPNsense UI from home network
 ```
 
-### 7.5 Administration settings
+### 9.5 Administration settings
 
 ```
 System → Settings → Administration:
@@ -723,7 +847,33 @@ System → Settings → Administration:
 
 ---
 
-## Step 8: Power On Homelab Devices
+## Step 10: Swap cables and power on homelab devices
+
+### 10.1 Shutdown homelab devices
+
+```bash
+# From Ubuntu controller, shutdown Pi 1 gracefully
+ssh kairos@<pi-ip>
+sudo poweroff
+
+# Shutdown Ubuntu controller
+sudo poweroff
+```
+
+### 10.2 Swap switches
+
+```
+Physical cable changes:
+
+Managed switch:
+  Port 1 ← extender (was: Mercury Port 1)
+  Port 2 ← Proxmox 1 (was: Mercury Port X)
+  Port 3 ← Pi 1 (was: Mercury Port Y)
+  Port 4 ← Ubuntu (was: Mercury Port Z)
+  Port 5 ← Mercury switch uplink (Mercury still has Proxmox 2,3,4)
+```
+
+### 10.3 Power on homelab devices
 
 ```bash
 # Pi 1 — power on
@@ -737,7 +887,7 @@ System → Settings → Administration:
 
 ---
 
-## Step 9: Verify
+## Step 11: Verify
 
 ```bash
 # From Ubuntu controller (10.0.0.32):
@@ -759,9 +909,9 @@ ssh root@192.168.1.x                    # Each Proxmox host — should work as b
 
 ---
 
-## Step 10: Post-Migration Cleanup
+## Step 12: Post-Migration Cleanup
 
-### 10.1 Remove Option C hack from Pi
+### 12.1 Remove Option C hack from Pi
 
 If the systemd service (Option C) was installed on the Pi for static IP:
 
@@ -774,7 +924,7 @@ sudo reboot
 # Pi comes back at 10.0.0.34 from OPNsense DHCP — permanent, no hack
 ```
 
-### 10.2 Update k3s repo for new IP
+### 12.2 Update k3s repo for new IP
 
 ```bash
 cd /Users/Shashank.Pai/Proxmox/kairos-test
@@ -791,7 +941,7 @@ git push origin main
 
 Pi self-updates on next reboot via git-pull.
 
-### 10.3 Set up OPNsense backup
+### 12.3 Set up OPNsense backup
 
 ```
 OPNsense UI → System → Configuration → Backups:
