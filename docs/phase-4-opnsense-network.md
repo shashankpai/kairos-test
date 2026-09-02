@@ -27,44 +27,106 @@ All homelab devices are on the same subnet as home devices — no isolation.
 
 ---
 
-## Target Network (After Migration)
+## Original Target Network (Planned — ABANDONED)
+
+> **Note:** The original plan used a VLAN trunk port on the TP-Link SG105E to carry
+> both VLAN 1 and VLAN 10 on a single cable to Proxmox 1. This was abandoned after
+> testing revealed the SG105E could not reliably handle Proxmox cluster (corosync knet)
+> traffic when the switch's 802.1Q VLAN processing was active. See the
+> [Troubleshooting](#troubleshooting) section for full details. The actual implementation
+> uses a USB Ethernet adapter instead of a trunk port.
 
 ```
-Main router (192.168.1.1, ZTE — unchanged)
+[ABANDONED PLAN]
+Main router (192.168.1.1) → Extender → Managed switch
+  Port 2: Trunk (VLAN 1+10) → Proxmox 1   ← THIS DID NOT WORK
+```
+
+---
+
+## Actual Network (As Built and Working)
+
+```
+Airtel router (192.168.1.1)
   │
-  └── WiFi → Range extender
+  └── WiFi → TP-Link RE200 Range Extender
                │
-               └── 5-port managed switch (TP-Link SG105E, 802.1Q VLAN)
-                     ├── Port 1: VLAN 1 → extender uplink
-                     ├── Port 2: Trunk (VLAN 1+10) → Proxmox 1
-                     │     ├── vmbr0 (VLAN 1) → 192.168.1.48 (existing VMs, management)
-                     │     ├── vmbr1 (VLAN 10) → 10.0.0.48 (homelab management)
-                     │     └── OPNsense VM
-                     │           ├── WAN: vmbr0 → 192.168.1.x (from home router)
-                     │           └── LAN: vmbr1 → 10.0.0.1 (homelab DHCP)
-                     ├── Port 3: VLAN 10 → Pi 1 (10.0.0.34, static via OPNsense)
-                     ├── Port 4: VLAN 10 → Ubuntu controller (10.0.0.32, static)
-                     └── Port 5: VLAN 1 → Mercury switch
-                           ├── Proxmox 2 (192.168.1.x — unchanged)
-                           ├── Proxmox 3 (192.168.1.x — unchanged)
-                           └── Proxmox 4 (192.168.1.x — unchanged)
+               └── Mercury 8-port unmanaged switch (VLAN 1 — home network)
+                     ├── Proxmox 1 (192.168.1.48) ─── eno1 (built-in NIC)
+                     │     │
+                     │     └── USB Ethernet adapter (enx00e04c2e6978)
+                     │           │
+                     │           └── TP-Link SG105E managed switch
+                     │                 (802.1Q DISABLED — plain untagged switch)
+                     │                 ├── Pi 1 (10.0.0.34)
+                     │                 └── (future homelab devices)
+                     │
+                     ├── Proxmox 2 (192.168.1.87)
+                     ├── Proxmox 3 (192.168.1.25)
+                     ├── Proxmox 4 (192.168.1.47)
+                     └── Ubuntu controller (192.168.1.32) [to move to homelab later]
+
+OPNsense VM (on Proxmox 1):
+  vtnet0 (WAN) → vmbr0 → eno1 → Mercury switch → 192.168.1.40 (static)
+  vtnet1 (LAN) → vmbr1 → USB NIC → Managed switch → 10.0.0.1
+
+Airtel router static route:
+  10.0.0.0/255.255.255.0 → gateway 192.168.1.40
 ```
 
-### What stays unchanged
+### What is unchanged
 
-- Home router (192.168.1.1) — still provides internet, DHCP for home devices
-- Range extender — still bridges WiFi to wired
-- Proxmox 2, 3, 4 — stay on 192.168.1.x via Mercury switch
-- All existing VMs on Proxmox 2, 3, 4 — unchanged
-- All existing VMs on Proxmox 1 attached to vmbr0 — unchanged
-- Home devices (phones, TV, laptop) — unchanged
+- Airtel router (`192.168.1.1`) — internet, home DHCP
+- Range extender (TP-Link RE200) — WiFi bridge, no routing capability
+- Proxmox 1 built-in NIC (`eno1`) — still on Mercury, still `192.168.1.48`
+- Proxmox 2, 3, 4 — still on Mercury, still `192.168.1.x`
+- All existing VMs on all Proxmox hosts — completely unchanged
+- Home devices (phones, laptops, TV) — unchanged
 
-### What changes
+### What changed
 
-- Proxmox 1: gets vmbr1 (VLAN 10 bridge), one cable carries both VLANs
-- Pi 1: moves to managed switch Port 3, gets 10.0.0.34 from OPNsense
-- Ubuntu: moves to managed switch Port 4, gets 10.0.0.32 from OPNsense
-- New OPNsense VM on Proxmox 1: routes between VLAN 1 and VLAN 10
+- Proxmox 1: got a USB Ethernet adapter as second NIC → `vmbr1` (10.0.0.x)
+- OPNsense VM (`9002`) on Proxmox 1: routes between home network and homelab
+- Managed switch: repurposed as plain untagged homelab switch (802.1Q disabled)
+- Pi 1: moved to managed switch, gets `10.0.0.34` from OPNsense DHCP reservation
+- Airtel router: static route `10.0.0.0/24 → 192.168.1.40` for cross-network access
+
+### Key IPs
+
+| Device | Interface | IP | Network |
+|--------|-----------|-----|---------|
+| Proxmox 1 (management) | eno1 → vmbr0 | `192.168.1.48` | Home |
+| Proxmox 1 (homelab) | USB NIC → vmbr1 | `10.0.0.48` | Homelab |
+| OPNsense WAN | vtnet0 | `192.168.1.40` (static) | Home |
+| OPNsense LAN | vtnet1 | `10.0.0.1` | Homelab |
+| Pi 1 | end0 | `10.0.0.34` (DHCP reservation) | Homelab |
+| Ubuntu controller | eth0 | `192.168.1.32` | Home (to migrate later) |
+| Proxmox 2 | eno1 | `192.168.1.87` | Home |
+| Proxmox 3 | eno1 | `192.168.1.25` | Home |
+| Proxmox 4 | eno1 | `192.168.1.47` | Home |
+
+### How devices reach the internet
+
+```
+Pi (10.0.0.34) → default gateway 10.0.0.1 (OPNsense LAN)
+  → OPNsense: NAT masquerade (source NAT: 10.0.0.0/24 → 192.168.1.40)
+  → OPNsense WAN → Mercury switch → extender → Airtel router → internet
+  ← response: internet → Airtel → extender → Mercury → OPNsense WAN
+  ← OPNsense: routes back to 10.0.0.34 via LAN
+  ← Pi receives response
+```
+
+### How home devices reach homelab
+
+```
+Mac/Ubuntu (192.168.1.x) → wants to reach 10.0.0.34
+  → sends to Airtel router (default gateway)
+  → Airtel router: static route says "10.0.0.0/24 → 192.168.1.40"
+  → packet forwarded to OPNsense WAN (192.168.1.40)
+  → OPNsense firewall: rule allows 192.168.1.0/24 → 10.0.0.0/24
+  → OPNsense LAN → USB NIC → managed switch → Pi
+  ← response follows same path in reverse
+```
 
 ---
 
@@ -847,84 +909,524 @@ System → Settings → Administration:
 
 ---
 
-## Step 10: Swap cables and power on homelab devices
+## Step 10: Connect devices to the managed switch
 
-### 10.1 Shutdown homelab devices
+### 10.1 Disable 802.1Q on the managed switch
 
-```bash
-# From Ubuntu controller, shutdown Pi 1 gracefully
-ssh kairos@<pi-ip>
-sudo poweroff
+After the trunk port approach failed (see [Troubleshooting](#troubleshooting)), the managed
+switch is used as a plain untagged switch. 802.1Q VLAN must be disabled:
 
-# Shutdown Ubuntu controller
-sudo poweroff
-```
+1. Open switch UI at `http://192.168.1.250`
+2. Go to **802.1Q VLAN Configuration**
+3. Select **Disable**
+4. Click **Apply**
 
-### 10.2 Swap switches
+The switch now behaves like an unmanaged switch — all ports are on the same network.
 
-```
-Physical cable changes:
+### 10.2 Add USB Ethernet adapter to Proxmox 1
 
-Managed switch:
-  Port 1 ← extender (was: Mercury Port 1)
-  Port 2 ← Proxmox 1 (was: Mercury Port X)
-  Port 3 ← Pi 1 (was: Mercury Port Y)
-  Port 4 ← Ubuntu (was: Mercury Port Z)
-  Port 5 ← Mercury switch uplink (Mercury still has Proxmox 2,3,4)
-```
+The USB NIC provides the physical path from Proxmox 1 (and OPNsense's LAN) to the managed
+switch without touching the existing `eno1` → Mercury switch connection.
 
-### 10.3 Power on homelab devices
+1. Plug a USB 3.0 Ethernet adapter (Realtek r8152 based) into a USB 3 port on Proxmox 1
+2. Plug the other end into any port on the managed switch
+
+Verify it's detected:
 
 ```bash
-# Pi 1 — power on
-# Sends DHCP request on VLAN 10 (Port 3)
-# OPNsense sees MAC d8:3a:dd:fc:b7:48 → assigns 10.0.0.34
+# On Proxmox 1
+dmesg | grep -i "r8152\|enx"
+ip link show | grep enx
+```
 
-# Ubuntu — power on
-# Sends DHCP request on VLAN 10 (Port 4)
-# OPNsense sees MAC → assigns 10.0.0.32
+It will appear as `enxXXXXXXXXXXXX` (MAC-based interface name).
+
+**Fix USB autosuspend** — the adapter may disconnect due to power management:
+
+```bash
+# Disable autosuspend immediately (before it disconnects)
+echo on > /sys/bus/usb/devices/3-2/power/control
+
+# Or disable for all USB devices
+for dev in /sys/bus/usb/devices/*/power/control; do echo on > $dev; done
+```
+
+To make it permanent, add to kernel boot parameters:
+
+```bash
+nano /etc/default/grub
+# Add usbcore.autosuspend=-1 to GRUB_CMDLINE_LINUX_DEFAULT
+update-grub
+```
+
+### 10.3 Update Proxmox 1 network config for USB NIC
+
+Remove the old VLAN sub-interface approach and replace with the USB NIC:
+
+```bash
+# On Proxmox 1
+nano /etc/network/interfaces
+```
+
+Remove the old blocks:
+```
+# VLAN 10 sub-interface for homelab   ← REMOVE THIS BLOCK
+auto vmbr0.10
+iface vmbr0.10 inet manual
+
+# Homelab bridge (VLAN 10)            ← REMOVE THIS BLOCK
+auto vmbr1
+iface vmbr1 inet static
+    address 10.0.0.48/24
+    bridge-ports vmbr0.10
+    bridge-stp off
+    bridge-fd 0
+```
+
+Add the new USB NIC blocks (replace `enxXXXXXXXXXXXX` with actual interface name):
+
+```
+# USB NIC for homelab network
+auto enx00e04c2e6978
+iface enx00e04c2e6978 inet manual
+
+# Homelab bridge (10.0.0.x) via USB NIC
+auto vmbr1
+iface vmbr1 inet static
+    address 10.0.0.48/24
+    bridge-ports enx00e04c2e6978
+    bridge-stp off
+    bridge-fd 0
+```
+
+Apply:
+
+```bash
+# Bring USB NIC up first (ifreload will fail if it's down)
+ip link set enx00e04c2e6978 up
+
+ifreload -a
+
+# Verify
+ip addr show vmbr1 | grep inet   # should show 10.0.0.48/24
+ip link show enx00e04c2e6978      # should show state UP
+```
+
+### 10.4 Connect Pi 1 to the managed switch
+
+Plug Pi 1's Ethernet cable into any port on the managed switch (that's not the USB NIC port).
+
+Pi 1 will request a DHCP lease from OPNsense. OPNsense's Kea DHCP server should assign
+`10.0.0.34` based on the MAC reservation.
+
+Verify:
+
+```bash
+# From Proxmox 1
+ping -c 3 10.0.0.34
 ```
 
 ---
 
-## Step 11: Verify
+## Step 11: OPNsense post-installation configuration
+
+### 11.1 Fix NAT (Source NAT masquerade)
+
+After changing WAN from DHCP to static, the automatic NAT rules may not be generated
+correctly. We found that `pfctl -s nat` showed no masquerade rules, which prevented
+the Pi from reaching the internet.
+
+**Fix:** Add a manual Source NAT rule.
+
+In OPNsense web UI → **Firewall → NAT → Source NAT**:
+
+1. Change mode to **Manual**
+2. Click **+Add:**
+   - **Interface:** WAN
+   - **Version:** IPv4
+   - **Protocol:** any
+   - **Source Address:** `10.0.0.0/24`
+   - **Destination:** any
+   - **Translate Source IP:** `Interface address` (= `192.168.1.40`)
+   - **Description:** `Masquerade LAN to WAN`
+3. Click **Save** → **Apply Changes**
+
+Verify from Pi:
 
 ```bash
-# From Ubuntu controller (10.0.0.32):
-ssh kairos@10.0.0.34                    # SSH to Pi — should work
-ping 10.0.0.1                           # OPNsense — should work
-ping 8.8.8.8                            # Internet — should work (routed through OPNsense)
-ping 192.168.1.48                       # Proxmox 1 — should work (routed to VLAN 1)
+sudo ping -c 3 8.8.8.8    # must work after this
+```
 
-# From Mac (192.168.1.6):
-ssh -i ~/.ssh/id_ed25519 kairos@10.0.0.34   # Should work (WAN firewall rule)
-https://10.0.0.1                             # OPNsense UI (WAN firewall rule)
+### 11.2 Set static WAN IP
 
-# From Proxmox 1 (192.168.1.48):
-ssh kairos@10.0.0.34                    # Should work (Proxmox has both VLANs)
+OPNsense WAN was initially on DHCP and got `192.168.1.40`. We made it static so it
+never changes (required for the static route on the Airtel router to work).
 
-# Verify Proxmox 2,3,4 unchanged:
-ssh root@192.168.1.x                    # Each Proxmox host — should work as before
+In OPNsense web UI → **Interfaces → WAN**:
+
+- **IPv4 Configuration Type:** `Static IPv4`
+- **IPv4 address:** `192.168.1.40 / 24`
+
+In **System → Gateways → Configuration**, edit `WAN_GW`:
+
+- **Interface:** WAN
+- **Address Family:** IPv4
+- **IP Address:** `192.168.1.1`
+
+Save → Apply Changes.
+
+Verify from OPNsense shell:
+
+```bash
+# type 8 in console for shell
+ping -c 3 8.8.8.8       # OPNsense internet — should work
+ping -c 3 192.168.1.1   # Airtel router — should work
+netstat -rn | grep default   # should show 192.168.1.1
+```
+
+### 11.3 Fix Kea DHCP (not starting automatically)
+
+We found that Kea DHCP was not running even though it was configured. Dnsmasq was
+competing with Kea and serving IPs from its own pool (Pi got `10.0.0.173` instead
+of the reserved `10.0.0.34`).
+
+**Fix 1: Remove Dnsmasq DHCP range**
+
+In OPNsense web UI → **Services → Dnsmasq DNS & DHCP → DHCP ranges**:
+
+- Delete any range defined for LAN
+
+Dnsmasq continues to run for DNS only. Kea takes over DHCP.
+
+**Fix 2: Start Kea DHCP**
+
+In OPNsense web UI → **System → Diagnostics → Services**:
+
+- Find `kea-dhcp4` and click the restart button
+
+Verify it's running:
+
+```bash
+# In OPNsense shell
+ps aux | grep kea
+```
+
+After Kea starts, reboot the Pi so it gets a fresh DHCP lease — it should receive
+`10.0.0.34` this time.
+
+### 11.4 OPNsense firewall rules (complete list)
+
+These are all the firewall rules configured:
+
+**LAN rules (auto-generated — do not modify):**
+
+| Interface | Protocol | Source | Destination | Port | Description |
+|-----------|----------|--------|-------------|------|-------------|
+| LAN | IPv4 any | LAN network | any | any | Default allow LAN to any |
+| LAN | IPv6 any | LAN network | any | any | Default allow LAN IPv6 to any |
+
+**WAN rules (manually added):**
+
+| Interface | Protocol | Source | Destination | Port | Description |
+|-----------|----------|--------|-------------|------|-------------|
+| WAN | TCP | 192.168.1.0/24 | 10.0.0.0/24 | 22 (SSH) | Allow SSH from home to homelab |
+| WAN | TCP/UDP | 192.168.1.0/24 | 10.0.0.1 | 443 (HTTPS) | Allow OPNsense UI from home |
+| WAN | any | 192.168.1.0/24 | 10.0.0.0/24 | any | Allow home network to homelab |
+| WAN | TCP | 192.168.1.0/24 | WAN address | 443 (HTTPS) | Allow OPNsense UI on WAN IP |
+
+**Why the rules are on WAN (not LAN):**
+
+Traffic from home (192.168.1.x) to homelab (10.0.0.x) enters OPNsense on the WAN
+interface. OPNsense evaluates the WAN rules for this traffic. The LAN rules apply
+to traffic originating from the homelab side.
+
+### 11.5 OPNsense DHCP static reservation (Pi 1)
+
+In **Services → Kea DHCP → Kea DHCPv4 → Subnets**:
+
+```
+Subnet: 10.0.0.0/24
+Pool: 10.0.0.100 - 10.0.0.200
+```
+
+In **Services → Kea DHCP → Kea DHCPv4 → Reservations**:
+
+```
+Subnet:      10.0.0.0/24
+MAC address: d8:3a:dd:fc:b7:48
+IP address:  10.0.0.34
+Hostname:    kairos-pi1
+Description: Pi 1 k3s cluster
 ```
 
 ---
 
-## Step 12: Post-Migration Cleanup
+## Step 12: Cross-network access from home devices
 
-### 12.1 Remove Option C hack from Pi
+### 12.1 Static route on Airtel router
 
-If the systemd service (Option C) was installed on the Pi for static IP:
+For all home network devices (Mac, Ubuntu, phones) to reach 10.0.0.x without tunnels:
+
+1. Open `http://192.168.1.1` (Airtel router)
+2. Go to **Advanced → Routing → Static Routing**
+3. Click **New Item:**
+   - **Name:** `homelab`
+   - **Egress:** `LAN`
+   - **Network Address:** `10.0.0.0`
+   - **Subnet Mask:** `255.255.255.0`
+   - **Gateway:** `192.168.1.40`
+
+The router sends ICMP redirects to clients telling them to use `192.168.1.40` for
+`10.0.0.x` traffic. This works for all wired and WiFi devices on the home network.
+
+**Note:** The TP-Link RE200 extender does not support static routes. All routing is
+handled at the Airtel router level.
+
+### 12.2 Access OPNsense web UI (no tunnel)
+
+With the WAN firewall rule in place, the OPNsense UI is accessible directly:
+
+```
+From Mac/Ubuntu: https://192.168.1.40
+Login: root / <your password>
+```
+
+No SSH tunnel required.
+
+### 12.3 SSH to Pi (no jump host)
+
+With the static route on the Airtel router, direct SSH works from any home device:
+
+```bash
+# From Mac or Ubuntu
+ssh kairos@10.0.0.34
+```
+
+If you need to use SSH agent forwarding (when the key is only on Mac):
+
+```bash
+ssh-add ~/.ssh/id_ed25519
+ssh -A kairos@10.0.0.34
+```
+
+### 12.4 Verify complete setup
+
+Run these checks in order:
+
+```bash
+# 1. From Proxmox 1 — verify OPNsense LAN
+ping -c 3 10.0.0.1      # should work
+
+# 2. From OPNsense shell (console → type 8) — verify internet
+ping -c 3 8.8.8.8       # should work
+ping -c 3 192.168.1.1   # should work
+
+# 3. From Pi — verify internet via OPNsense
+sudo ping -c 3 8.8.8.8  # should work
+
+# 4. From Ubuntu (192.168.1.32) — verify cross-network access
+ping 10.0.0.34           # should work (via Airtel static route)
+ssh kairos@10.0.0.34     # should work
+nc -zv 192.168.1.40 443  # should connect (OPNsense UI)
+
+# 5. From Mac — add route if needed, then test
+sudo route -n add -net 10.0.0.0/24 192.168.1.40  # Mac-specific
+ping 10.0.0.34
+ssh kairos@10.0.0.34
+```
+
+---
+
+## Troubleshooting
+
+### Problem 1: Trunk port approach — managed switch dropped cluster traffic
+
+**What happened:** When Proxmox 1 was moved to the managed switch Port 2 (configured
+as trunk: VLAN 1 untagged + VLAN 10 tagged), the Proxmox cluster became unstable.
+After 2-5 minutes, the Proxmox web UI would become unreachable and the cluster would
+lose quorum visibility.
+
+**Symptoms:**
+- Initial connection works fine
+- After 2-5 minutes: Proxmox web UI stops loading
+- SSH to Proxmox 1 times out
+- Moving cable back to Mercury switch immediately restores everything
+- `pvecm status` showed `Quorate: Yes` immediately after moving back
+
+**Tests performed:**
+| Test | Result |
+|------|--------|
+| Proxmox 1 on Mercury (unmanaged) | Stable — works perfectly |
+| Proxmox 1 on managed Port 2, VLAN 1 untagged + VLAN 10 tagged | Drops after 2-5 min |
+| Proxmox 1 on managed Port 2, VLAN 10 removed (VLAN 1 only) | Still drops |
+| IGMP snooping disabled on switch, retry | Still drops |
+| 802.1Q disabled entirely on switch | Flaky — intermittent drops |
+
+**Root cause:** The TP-Link SG105E is a budget entry-level managed switch. Its internal
+switching capacity and packet buffer are insufficient for Proxmox corosync knet traffic,
+which sends frequent small UDP packets (port 5405) between all cluster nodes. When the
+managed switch was in the path between Proxmox 1 and the rest of the cluster, the switch
+couldn't handle the traffic pattern reliably regardless of VLAN settings.
+
+**Resolution:** Kept Proxmox 1 on the Mercury switch (proven stable). Used a USB Ethernet
+adapter as a second NIC to connect Proxmox 1 to the managed switch for VLAN 10 only.
+The managed switch never sees cluster traffic.
+
+---
+
+### Problem 2: USB NIC disconnecting (error -71)
+
+**Symptoms:**
+```
+r8152-cfgselector 3-2: USB disconnect, device number 14
+usb 3-1: device not accepting address 12, error -71
+Cannot find device "enx00e04c2e6978"
+```
+
+**Cause:** USB autosuspend — Linux power management puts the USB device to sleep.
+
+**Fix:**
+```bash
+echo on > /sys/bus/usb/devices/3-2/power/control
+```
+
+If the device path isn't found (device already disconnected), replug the adapter and
+immediately run:
+```bash
+for dev in /sys/bus/usb/devices/*/power/control; do echo on > $dev; done
+```
+
+---
+
+### Problem 3: Pi getting dynamic IP (10.0.0.173) instead of reserved (10.0.0.34)
+
+**Cause:** Both Dnsmasq and Kea DHCP were enabled and competing. Dnsmasq was winning
+and serving IPs from its own pool without honoring Kea's MAC reservations.
+
+**Fix:**
+1. Delete the DHCP range in **Services → Dnsmasq → DHCP ranges**
+2. Ensure Kea DHCP is enabled and started (**System → Diagnostics → Services**)
+3. Reboot Pi to get a fresh DHCP lease
+
+---
+
+### Problem 4: Kea DHCP not starting automatically
+
+**Symptoms:** `ps aux | grep kea` shows nothing. Pi gets no DHCP lease.
+
+**Cause:** Kea requires the subnet to be configured AND the service to be explicitly
+saved/applied in the web UI. It doesn't start automatically just from being "enabled".
+
+**Fix:**
+1. Go to **Services → Kea DHCP → Kea DHCPv4 → Settings** — verify Enabled + LAN selected
+2. Go to **Services → Kea DHCP → Kea DHCPv4 → Subnets** — verify `10.0.0.0/24` exists with pool
+3. Go to **System → Diagnostics → Services** → find `kea-dhcp4` → click restart
+
+---
+
+### Problem 5: Pi has internet routing but no actual internet (NAT missing)
+
+**Symptoms:**
+- `ping 10.0.0.1` works from Pi (OPNsense reachable)
+- `ping 8.8.8.8` fails from Pi
+- `pfctl -s nat` on OPNsense shows no masquerade rules
+- OPNsense itself can ping 8.8.8.8
+
+**Cause:** After changing WAN from DHCP to static, the automatic NAT rule generation
+did not create a masquerade rule. Traffic from Pi reached OPNsense and was forwarded
+to the internet, but the source IP was still `10.0.0.34` — the internet couldn't route
+the response back to a private address.
+
+**Fix:** Add manual Source NAT rule in **Firewall → NAT → Source NAT**:
+
+```
+Mode: Manual
+Interface: WAN
+Source: 10.0.0.0/24
+Destination: any
+Translate Source IP: Interface address (192.168.1.40)
+```
+
+---
+
+### Problem 6: Home devices can't reach 10.0.0.x
+
+**Symptoms:**
+- Airtel router sends ICMP redirect: `Redirect Host(New nexthop: 192.168.1.40)`
+- But ping/nc still fails
+
+**Cause (two separate issues):**
+1. OPNsense WAN firewall was blocking all incoming traffic from home network to homelab
+2. Ubuntu/Mac wasn't accepting the ICMP redirect and updating its local route
+
+**Fix 1 — OPNsense WAN firewall rule:**
+
+In **Firewall → Rules → WAN** add:
+```
+Action: Pass
+Protocol: any
+Source: 192.168.1.0/24
+Destination: 10.0.0.0/24
+Description: Allow home network to homelab
+```
+
+**Fix 2 — OPNsense UI accessible on WAN IP:**
+
+In **Firewall → Rules → WAN** add:
+```
+Action: Pass
+Protocol: TCP
+Source: 192.168.1.0/24
+Destination: WAN address
+Port: 443
+Description: Allow OPNsense UI from home
+```
+
+**Fix 3 — Manual route on Linux if redirect isn't accepted:**
+
+```bash
+# Ubuntu
+sudo ip route add 10.0.0.0/24 via 192.168.1.40
+
+# Mac
+sudo route -n add -net 10.0.0.0/24 192.168.1.40
+```
+
+---
+
+## Post-Migration Tasks (Pending)
+
+### Ubuntu controller migration
+
+Ubuntu controller is still on the home network (`192.168.1.32` on Mercury switch).
+To move it to the homelab network:
+
+1. Find Ubuntu's MAC address: `ip link show` on Ubuntu
+2. Add DHCP reservation in OPNsense Kea: MAC → `10.0.0.32`
+3. Move Ubuntu's cable to the managed switch
+4. Reboot Ubuntu — it gets `10.0.0.32` from OPNsense
+
+> **Note:** Once Ubuntu is on 10.0.0.x, you can no longer SSH to it from home directly
+> without the static route on the Airtel router. Ensure the route is in place first.
+
+### Remove Option C static IP hack from Pi
+
+The Pi may still have the systemd static IP service from the old approach:
 
 ```bash
 ssh kairos@10.0.0.34
+sudo systemctl status kairos-static-ip 2>/dev/null
+
+# If it exists, remove it:
 sudo systemctl disable kairos-static-ip.service
 sudo rm /usr/local/lib/systemd/system/kairos-static-ip.service
 sudo rm /usr/local/bin/set-static-ip.sh
 sudo reboot
-# Pi comes back at 10.0.0.34 from OPNsense DHCP — permanent, no hack
 ```
 
-### 12.2 Update k3s repo for new IP
+OPNsense's DHCP reservation now handles the static IP permanently.
+
+### Update k3s repo for new IP
 
 ```bash
 cd /Users/Shashank.Pai/Proxmox/kairos-test
@@ -932,120 +1434,89 @@ cd /Users/Shashank.Pai/Proxmox/kairos-test
 # Update all references from 192.168.1.34 to 10.0.0.34:
 #   - docs/phase-1-flashing.md
 #   - build/cloud-config-pi1.yaml
-#   - cloud-config/20_k8s_workloads.yaml (if it references the IP)
+#   - cloud-config/20_k8s_workloads.yaml
 
 git add -A
-git commit -m "Migrate to homelab subnet 10.0.0.x (OPNsense)"
+git commit -m "Migrate Pi to homelab subnet 10.0.0.x (OPNsense)"
 git push origin main
 ```
 
-Pi self-updates on next reboot via git-pull.
-
-### 12.3 Set up OPNsense backup
+### OPNsense backup
 
 ```
 OPNsense UI → System → Configuration → Backups:
   ├── Enable automatic backups
   ├── Schedule: weekly
-  └── Destination: encrypted backup to Proxmox 1 storage
+  └── Download a manual backup now as a baseline
 ```
 
 ---
 
 ## Rollback Plan
 
-### Quick rollback (5 minutes)
+### Quick rollback — restore original flat network
 
 ```
-1. Unplug everything from managed switch
-2. Plug everything back into Mercury switch (original config)
-3. Remove vmbr1 from Proxmox 1:
-   ssh root@192.168.1.48
-   # Remove vmbr1 block from /etc/network/interfaces
-   ifreload -a
-4. Stop OPNsense VM
-5. Everything is back to original state
+1. Move Pi cable back to Mercury switch
+2. Remove USB NIC from managed switch
+3. Stop OPNsense VM: qm stop 9002
+4. Pi will DHCP on 192.168.1.x from Airtel router
+5. Everything else is unchanged — Proxmox cluster never moved
 ```
 
-### If Proxmox 1 becomes unreachable after cable swap
+### Remove vmbr1 from Proxmox 1 (optional cleanup)
 
+```bash
+ssh root@192.168.1.48
+nano /etc/network/interfaces
+# Remove the enxXXXX and vmbr1 blocks
+ifreload -a
 ```
-1. Connect monitor + keyboard to Proxmox 1
-2. Login at console
-3. Check: ip addr show vmbr0
-4. If vmbr0 has no IP, the trunk port config is wrong
-5. Move Proxmox 1 cable to Port 1 (VLAN 1 only, not trunk)
-6. Reboot Proxmox 1
-7. It should come back at 192.168.1.48
-8. Fix switch trunk port config and retry
-```
-
----
-
-## Risk Assessment
-
-| Risk | Likelihood | Impact | Mitigation |
-|------|-----------|--------|------------|
-| Switch VLAN config wrong | Medium | Proxmox 1 unreachable | Console access, rollback plan |
-| OPNsense install fails | Low | No homelab DHCP | Retry install, Pi stays on Option C |
-| Existing VMs affected | Very Low | VMs lose network | They're on vmbr0/VLAN 1 — unchanged |
-| OPNsense VM crashes later | Low | Homelab loses internet | Reboot VM, set up HA later |
-| Mercury switch port count | Low | Can't add more home devices | Use spare managed switch ports |
 
 ---
 
 ## Future Expansion
 
-### Adding more homelab devices (10.0.0.x)
+### Adding more homelab devices
 
-Only Ports 3 and 4 are on VLAN 10. If you need more homelab ports:
+The managed switch has 5 ports. With USB NIC on Port 1 and Pi on Port 2, there are
+3 free ports for future homelab devices.
 
-**Option A — Add a small unmanaged switch on Port 3 or 4:**
+For more capacity, add a small unmanaged switch to the managed switch:
+
 ```
-Managed Port 3 (VLAN 10) → 5-port unmanaged switch (~₹500)
-  ├── Pi 1 (10.0.0.34)
-  ├── Pi 2 (10.0.0.35)
+Managed switch Port 3 → 5-port unmanaged switch
+  ├── Pi 2
+  ├── Pi 3
   └── future devices
 ```
 
-**Option B — Upgrade to 8-port managed switch later (~₹3,500):**
-```
-8-port managed switch:
-  Port 1: VLAN 1 → extender
-  Port 2: Trunk → Proxmox 1
-  Port 3-7: VLAN 10 → homelab devices (5 ports)
-  Port 8: VLAN 1 → Mercury switch
-```
+All devices get IPs from OPNsense DHCP (`10.0.0.100-200` pool). Add reservations
+for each as needed.
 
-### Adding more Proxmox hosts to homelab
+### Upgrade path: dual-NIC mini PC as dedicated firewall
 
-Move a Proxmox host from Mercury (VLAN 1) to the managed switch trunk port (Port 2).
-But Port 2 is taken by Proxmox 1. To add a second Proxmox host on both VLANs, you need
-the 8-port switch (which has more trunk-capable ports).
-
-Alternatively, put the new Proxmox host on VLAN 10 only (Port 3 or 4) — it'll be homelab
-only, no access to 192.168.1.x VMs. Fine if it's a new host with no existing VMs.
-
-### OPNsense HA (high availability)
-
-With 4 Proxmox hosts, set up a second OPNsense VM on Proxmox 2 for failover:
+The current setup (OPNsense as a VM on Proxmox 1) works well but has a single point
+of failure. The better long-term approach is a **dedicated OPNsense box** with two
+built-in NICs:
 
 ```
-Proxmox 1: OPNsense primary (10.0.0.1)
-Proxmox 2: OPNsense secondary (10.0.0.2)
-CARP virtual IP: 10.0.0.1 (floats between primary and secondary)
+Dedicated OPNsense mini PC (e.g. Protectli, Beelink with dual NIC):
+  NIC 1 (WAN) → Mercury switch → 192.168.1.40
+  NIC 2 (LAN) → Managed switch → 10.0.0.1
+
+Benefits:
+  - OPNsense independent of Proxmox — if Proxmox goes down, homelab still has internet
+  - No USB NIC reliability concerns
+  - Standard firewall deployment
+  - Can be reinstalled in <30 min using this documentation
 ```
 
-Requires Proxmox 2 on a trunk port — needs the 8-port switch upgrade.
+### Inter-VLAN communication
 
----
+Any device on `192.168.1.x` can reach `10.0.0.x` provided:
+1. The Airtel static route is in place (`10.0.0.0/24 → 192.168.1.40`)
+2. The OPNsense WAN firewall rule allows the traffic
 
-## Timeline
-
-| Phase | When | Duration | Depends on |
-|-------|------|----------|------------|
-| Phase 0: Pi fix (Option C) | Today | 30 min | Nothing |
-| Phase 1: Order switch | Today | 2 min | Nothing |
-| Phase 2: Switch setup + VLAN config | When switch arrives | 30 min | Switch in hand |
-| Phase 3: OPNsense VM + migration | When switch arrives | 1-2 hours | Phase 2 complete |
-| Phase 4: Cleanup + verify | After migration | 30 min | Phase 3 complete |
+OPNsense controls all cross-network access via firewall rules — add or restrict
+rules in **Firewall → Rules → WAN** as needed.
