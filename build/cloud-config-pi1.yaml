@@ -1,41 +1,49 @@
 #cloud-config
-# Mounts the USB SSD and configures k3s's local-path provisioner to use
-# it for all PVCs, so persistent volumes get fast SSD I/O instead of
-# the slow boot pen drive.
+# Pi 1 flash-time config — k3s server, 10.0.0.34 (VLAN 10)
+# NOT committed to the repo (contains SSH keys and passwords).
 #
-# Uses partition LABEL "kairos-ssd" (not UUID) so the same cloud-config
-# works on every Pi in the fleet — each Pi's SSD is formatted with the
-# same label. This is the Kairos-native best practice for per-node
-# local storage on small edge clusters.
+# This config runs ONCE at flash time and sets up:
+# 1. Static IP (DHCP via OPNsense Kea, static reservation 10.0.0.34)
+# 2. SSD detection, formatting, mounting (fs stage — runs FIRST, before k3s)
+# 3. k3s data-dir on SSD (so Grafana JS is fast from first boot)
+# 4. Git-pull bootstrap (pulls repo on every boot)
 #
-# IMPORTANT: On Kairos, the rootfs is read-only. /mnt is on the read-only
-# rootfs, so we can't create mount points there. We use /usr/local/ssd
-# instead, which is on the COS_PERSISTENT partition (writable).
-#
-# Why not Longhorn? Longhorn is a distributed block storage system that
-# needs 3+ nodes for quorum and ~1GB RAM overhead. For a 2-Pi edge
-# cluster where each Pi has its own SSD, local-path provisioner + SSD
-# is simpler and more resource-efficient. Longhorn is the upgrade path
-# when the fleet grows to 5+ nodes with storage on each.
-#
-# From-scratch flow: plug in a raw/unformatted USB SSD, flash the Pi,
-# boot. The fs stage detects the SSD, formats it with label kairos-ssd
-# (if not already formatted), mounts it, and the network stage patches
-# the local-path provisioner to use it. No manual steps needed.
-#
-# Three things happen:
-# 1. fs stage: detects, formats (if needed), and mounts the SSD
-# 2. network stage: patches the local-path provisioner ConfigMap to use
-#    /usr/local/ssd/k3s-storage as the storage path (after k3s is up)
-# 3. reconcile stage: re-applies the provisioner patch (drift correction)
-#
-# The SSD is detected as the largest non-boot disk. On a Pi booting from
-# a USB pen drive, the SSD will typically be /dev/sdb. We detect it by
-# checking for the largest disk that isn't the boot device.
+# Everything else (k8s workloads, monitoring stack, reconciliation) is
+# synced from GitHub by 10_git-pull.yaml on every boot.
+
+users:
+  - name: kairos
+    groups:
+      - admin
+    ssh_authorized_keys:
+      - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHo5qJ/2w3UcBUoRkXPxkv7nbL2OXEhpopROI906HPBY ansible-controller"
+
+k3s:
+  enabled: true
 
 write_files:
+  # --- Static IP (DHCP via OPNsense) ---
+  # Pi gets 10.0.0.34 from OPNsense Kea DHCP (static reservation by MAC).
+  # systemd-networkd on this Kairos image always selects 20-dhcp.network
+  # for the end0 interface (Pi 4 Gigabit Ethernet).
+  # We overwrite it with DHCP config to get the reserved IP from Kea.
+  - path: /etc/systemd/network/20-dhcp.network
+    permissions: "0644"
+    content: |
+      [Match]
+      Name=end0
+
+      [Network]
+      DHCP=yes
+      DNS=10.0.0.1
+      DNS=8.8.8.8
+
+  # --- SSD mount unit ---
+  # Mounts the USB SSD at /usr/local/ssd BEFORE k3s starts.
+  # Uses partition label "kairos-ssd" (not UUID) so it works on every Pi.
+  # If SSD is not plugged in, the mount fails silently and k3s uses pen drive.
   - path: /etc/systemd/system/usr-local-ssd.mount
-    permissions: 0644
+    permissions: "0644"
     content: |
       [Unit]
       Description=Mount USB SSD at /usr/local/ssd
@@ -51,9 +59,35 @@ write_files:
       [Install]
       WantedBy=multi-user.target
 
+  # --- Git-pull bootstrap ---
+  # The ONLY cloud-config file written at flash time (besides this one).
+  # On every boot: pulls the repo tarball and syncs cloud-config/*.yaml
+  # into /oem/ so all other configs are self-updating from GitHub.
+  - path: /oem/10_git-pull.yaml
+    permissions: "0644"
+    content: |
+      #cloud-config
+      stages:
+        boot:
+          - name: "Pull config repo and sync cloud-config"
+            commands:
+              - |
+                set -e
+                mkdir -p /oem/cloud-config-files
+                tmpdir=$(mktemp -d)
+                curl -sL "https://github.com/shashankpai/kairos-test/archive/refs/heads/main.tar.gz" -o "$tmpdir/repo.tar.gz"
+                rm -rf /oem/cloud-config-files/*
+                tar xzf "$tmpdir/repo.tar.gz" -C /oem/cloud-config-files/ --strip-components=1
+                rm -rf "$tmpdir"
+                if [ -d /oem/cloud-config-files/cloud-config ]; then
+                  for f in /oem/cloud-config-files/cloud-config/*.yaml; do
+                    [ -f "$f" ] && cp "$f" /oem/
+                  done
+                fi
+
 stages:
   fs:
-    - name: "Detect, format, and mount SSD"
+    - name: "Detect, format, and mount SSD (first boot only)"
       commands:
         - |
           # Create mount point on the persistent partition (rootfs is read-only)
@@ -75,8 +109,6 @@ stages:
 
           # SSD is not formatted — find the SSD device.
           # Strategy: find the largest disk that is NOT the boot device.
-          # The boot device is the one containing the COS_STATE partition
-          # or the root filesystem.
           BOOT_DISK=""
           # Find which disk has the COS_STATE partition (Kairos boot marker)
           for dev in /dev/sd[a-z] /dev/nvme[0-9]n[0-9]; do
@@ -151,32 +183,4 @@ stages:
             cat >> /etc/rancher/k3s/config.yaml << 'EOCONF'
 data-dir: /usr/local/ssd/k3s-data
 EOCONF
-          fi
-  network:
-    - name: "Configure local-path provisioner to use SSD"
-      commands:
-        - |
-          # Wait for k3s API to be ready
-          for i in $(seq 1 60); do
-            if sudo k3s kubectl get nodes >/dev/null 2>&1; then break; fi
-            sleep 5
-          done
-          # Patch the local-path provisioner to use the SSD for all PVCs.
-          # This is idempotent — safe to run on every boot and reconcile.
-          # Only patch if the SSD is actually mounted.
-          if mountpoint -q /usr/local/ssd; then
-            sudo k3s kubectl patch configmap local-path-config -n kube-system \
-              --type='json' \
-              -p='[{"op":"replace","path":"/data/config.json","value":"{\"nodePathMap\":[{\"node\":\"DEFAULT_PATH_FOR_NON_LISTED_NODES\",\"paths\":[\"/usr/local/ssd/k3s-storage\"]}]}"}]' \
-              2>&1 || true
-          fi
-  reconcile:
-    - name: "Reconcile local-path provisioner to SSD"
-      commands:
-        - |
-          if mountpoint -q /usr/local/ssd; then
-            sudo k3s kubectl patch configmap local-path-config -n kube-system \
-              --type='json' \
-              -p='[{"op":"replace","path":"/data/config.json","value":"{\"nodePathMap\":[{\"node\":\"DEFAULT_PATH_FOR_NON_LISTED_NODES\",\"paths\":[\"/usr/local/ssd/k3s-storage\"]}]}"}]' \
-              2>&1 || true
           fi

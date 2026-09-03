@@ -1,7 +1,11 @@
-# Phase 3: SSD-backed k3s storage
+# SSD-backed k3s storage
 
 How and why all k3s data (container images, etcd, PVCs) is stored on a USB SSD rather than
 the boot USB pen drive — and what that means for performance and operations.
+
+This is implemented using a **hybrid approach**:
+- **Flash-time setup** (runs once on first boot, before k3s starts)
+- **Repo-based reconciliation** (runs on every boot and every 60 minutes)
 
 ---
 
@@ -47,9 +51,59 @@ touches it during normal operation.
 
 ---
 
-## How it's configured
+## How it's configured (Hybrid Approach)
 
-### `/etc/rancher/k3s/config.yaml` (written by `05_ssd_storage.yaml`)
+### Flash-Time Setup (runs once on first boot)
+
+The flash-time config (`build/cloud-config-pi1.yaml`) contains the **fs stage** that runs
+very early, before k3s starts:
+
+1. **SSD detection** — finds the largest non-boot disk
+2. **SSD formatting** — wipes and formats with `mkfs.ext4 -L kairos-ssd`
+3. **SSD mounting** — creates systemd mount unit and mounts at `/usr/local/ssd`
+4. **k3s config** — writes `/etc/rancher/k3s/config.yaml` with `data-dir: /usr/local/ssd/k3s-data`
+
+This ensures:
+- SSD is ready **before k3s starts** on first boot
+- k3s uses SSD for all data from the very beginning
+- No performance penalty on first boot (no waiting for SSD to be detected later)
+
+### Systemd Mount Unit (written by flash-time config)
+
+```ini
+[Unit]
+Description=Mount USB SSD at /usr/local/ssd
+After=local-fs.target
+Before=k3s.service
+
+[Mount]
+What=LABEL=kairos-ssd
+Where=/usr/local/ssd
+Type=ext4
+Options=defaults,noatime
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`Before=k3s.service` ensures the SSD is mounted before k3s starts. If the SSD is absent
+(e.g., not plugged in), k3s falls back to the pen drive's default data dir — the node
+still works, just slower.
+
+### Repo-Based Reconciliation (runs on every boot and every 60 minutes)
+
+The repo config (`cloud-config/01_ssd_storage.yaml`) contains the **network** and **reconcile**
+stages:
+
+1. **`network` stage** — after k3s is ready:
+   - Patches the local-path provisioner ConfigMap to store PVCs in
+     `/usr/local/ssd/k3s-storage`
+
+2. **`reconcile` stage** — every 60 minutes:
+   - Re-applies the local-path provisioner patch (drift correction)
+   - Ensures PVCs stay on SSD even if someone manually changed the provisioner config
+
+### `/etc/rancher/k3s/config.yaml` (written by flash-time config)
 
 ```yaml
 data-dir: /usr/local/ssd/k3s-data
@@ -58,39 +112,6 @@ data-dir: /usr/local/ssd/k3s-data
 k3s reads this file on startup. When the SSD is mounted at `/usr/local/ssd` before k3s
 starts, k3s uses the SSD for all its data from first boot.
 
-### `05_ssd_storage.yaml` — what it does on each boot
-
-1. **`fs` stage** — very early, before k3s starts:
-   - Creates `/usr/local/ssd` mount point
-   - If already mounted: no-op
-   - If SSD has `LABEL=kairos-ssd`: enables and starts `usr-local-ssd.mount`
-   - If SSD is raw/unformatted: detects the largest non-boot disk, formats it
-     with `mkfs.ext4 -L kairos-ssd`, mounts it, writes k3s `data-dir` config
-
-2. **`network` stage** — after k3s is ready:
-   - Patches the local-path provisioner ConfigMap to store PVCs in
-     `/usr/local/ssd/k3s-storage`
-
-3. **`reconcile` stage** — every 60 minutes:
-   - Re-applies the local-path provisioner patch (drift correction)
-
-### `usr-local-ssd.mount` (written by `05_ssd_storage.yaml`)
-
-```ini
-[Mount]
-What=LABEL=kairos-ssd
-Where=/usr/local/ssd
-Type=ext4
-Options=defaults,noatime
-
-[Unit]
-Before=k3s.service
-```
-
-`Before=k3s.service` ensures the SSD is mounted before k3s starts. If the SSD is absent
-(e.g., not plugged in), k3s falls back to the pen drive's default data dir — the node
-still works, just slower.
-
 ---
 
 ## Disk detection logic
@@ -98,15 +119,19 @@ still works, just slower.
 The SSD is detected as the **largest non-boot disk**. On a Pi booting from a USB pen drive,
 the pen drive is `sda` and the SSD is `sdb` (or `sdc` if multiple USB devices are connected).
 
-The detection logic in `05_ssd_storage.yaml`:
+The detection logic runs **only once at flash time** (in the flash-time config's fs stage):
 1. Find the disk containing the `COS_STATE` or `COS_PERSISTENT` partition → this is the
    boot disk.
 2. Among remaining disks, pick the one with the largest byte count.
 3. Wipe it, partition it, format with `ext4 -L kairos-ssd`.
 
-Using a partition **label** (`LABEL=kairos-ssd`) instead of UUID means the same
-cloud-config works on every Pi in the fleet — each Pi's SSD gets the same label at
-format time.
+**After first boot**, the SSD is identified by its partition label (`LABEL=kairos-ssd`),
+not by disk detection. This means:
+- On subsequent boots, the SSD is mounted instantly (no detection logic needed)
+- The same systemd mount unit works on every Pi in the fleet
+- If you swap the SSD with a new one, the fs stage in the flash-time config would need
+  to run again (which only happens on first boot). For now, manually format the new SSD
+  with `mkfs.ext4 -L kairos-ssd` and reboot.
 
 ---
 

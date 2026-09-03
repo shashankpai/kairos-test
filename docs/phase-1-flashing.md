@@ -27,7 +27,7 @@ This document covers Pi 1 (k3s server). Pi 2 (agent) will be added in a later ph
 ## Architecture
 
 ```
-Pi 1 (192.168.1.34) — k3s server + control plane
+Pi 1 (10.0.0.34) — k3s server + control plane
   ├── USB pen drive → Kairos OS (immutable, read-only rootfs)
   └── USB SSD → k3s data (containerd images, etcd, PVCs)
        /usr/local/ssd/k3s-data/       ← all k3s data (containerd layers live here!)
@@ -40,10 +40,11 @@ to read. On an SSD, the same file reads in milliseconds. The `data-dir` setting 
 k3s data (containerd, etcd, TLS certs, PVCs) to the SSD from first boot — no migration ever
 needed.
 
-**Two-boot sequence:** The SSD config is self-updating from git (not baked into the image).
-So it takes two boots to fully activate the SSD:
-- **Boot 1** → static IP .34 is live, git-pull syncs `05_ssd_storage.yaml` into `/oem/`
-- **Boot 2** (manual reboot) → SSD detected, formatted, mounted, k3s uses SSD from here
+**Hybrid approach:** SSD setup is **baked into the flash-time config** so it runs on first boot
+before k3s starts. The repo contains a reconciliation config (`01_ssd_storage.yaml`) that
+re-applies the local-path provisioner patch every 60 minutes (drift correction).
+- **Boot 1** → SSD detected, formatted, mounted; k3s data is on SSD from the start
+- **Every boot** → git-pull syncs repo configs; reconciliation ensures local-path provisioner uses SSD
 
 ---
 
@@ -56,6 +57,15 @@ directly on the Ubuntu controller machine:
 mkdir -p ~/kairos-flash
 cat > ~/kairos-flash/cloud-config-pi1.yaml << 'EOF'
 #cloud-config
+# Pi 1 flash-time config — k3s server, 10.0.0.34 (VLAN 10)
+# NOT committed to the repo (contains SSH keys and passwords).
+#
+# This config runs ONCE at flash time and sets up:
+# 1. DHCP IP (gets 10.0.0.34 from OPNsense Kea, static reservation by MAC)
+# 2. SSD detection, formatting, mounting (fs stage — runs FIRST, before k3s)
+# 3. k3s data-dir on SSD (so Grafana JS is fast from first boot)
+# 4. Git-pull bootstrap (pulls repo on every boot)
+
 users:
   - name: kairos
     groups:
@@ -67,39 +77,47 @@ k3s:
   enabled: true
 
 write_files:
-  # --- Static IP fix ---
-  # Overwrite 20-dhcp.network to NOT match end0 (Pi 4 Ethernet).
-  # systemd-networkd merges all matching .network files with later filenames
-  # overriding earlier ones. By excluding end0 from the DHCP config, our
-  # 99-end0-static.network below becomes the sole match for end0.
+  # --- DHCP IP (from OPNsense Kea) ---
+  # Pi gets 10.0.0.34 from OPNsense Kea DHCP (static reservation by MAC d8:3a:dd:fc:b7:48).
+  # systemd-networkd on this Kairos image always selects 20-dhcp.network
+  # for the end0 interface (Pi 4 Gigabit Ethernet).
+  # We configure it for DHCP to get the reserved IP from Kea.
   - path: /etc/systemd/network/20-dhcp.network
-    permissions: "0644"
-    content: |
-      [Match]
-      Name=en* !end0
-
-      [Network]
-      DHCP=yes
-      [DHCP]
-      ClientIdentifier=mac
-
-  # Static IP for Pi 1. end0 is the Pi 4's built-in Gigabit Ethernet.
-  - path: /etc/systemd/network/99-end0-static.network
     permissions: "0644"
     content: |
       [Match]
       Name=end0
 
       [Network]
-      DHCP=no
-      Address=192.168.1.34/24
-      Gateway=192.168.1.1
-      DNS=192.168.1.1
+      DHCP=yes
+      DNS=10.0.0.1
       DNS=8.8.8.8
 
+  # --- SSD mount unit ---
+  # Mounts the USB SSD at /usr/local/ssd BEFORE k3s starts.
+  # Uses partition label "kairos-ssd" (not UUID) so it works on every Pi.
+  # If SSD is not plugged in, the mount fails silently and k3s uses pen drive.
+  - path: /etc/systemd/system/usr-local-ssd.mount
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Mount USB SSD at /usr/local/ssd
+      After=local-fs.target
+      Before=k3s.service
+
+      [Mount]
+      What=LABEL=kairos-ssd
+      Where=/usr/local/ssd
+      Type=ext4
+      Options=defaults,noatime
+
+      [Install]
+      WantedBy=multi-user.target
+
   # --- Git-pull bootstrap ---
-  # The ONLY cloud-config file written at flash time.
-  # On every boot: pulls the repo tarball, syncs cloud-config/*.yaml into /oem/.
+  # The ONLY cloud-config file written at flash time (besides this one).
+  # On every boot: pulls the repo tarball and syncs cloud-config/*.yaml
+  # into /oem/ so all other configs are self-updating from GitHub.
   - path: /oem/10_git-pull.yaml
     permissions: "0644"
     content: |
@@ -121,6 +139,105 @@ write_files:
                     [ -f "$f" ] && cp "$f" /oem/
                   done
                 fi
+
+stages:
+  fs:
+    - name: "Detect, format, and mount SSD (first boot only)"
+      commands:
+        - |
+          # Create mount point on the persistent partition (rootfs is read-only)
+          mkdir -p /usr/local/ssd /usr/local/ssd/k3s-storage
+
+          # Check if the SSD is already mounted (e.g., from a previous boot)
+          if mountpoint -q /usr/local/ssd; then
+            exit 0
+          fi
+
+          # Check if a partition with label kairos-ssd already exists
+          if blkid -L kairos-ssd >/dev/null 2>&1; then
+            # SSD is already formatted — just mount it
+            systemctl daemon-reload
+            systemctl enable usr-local-ssd.mount
+            systemctl start usr-local-ssd.mount
+            exit 0
+          fi
+
+          # SSD is not formatted — find the SSD device.
+          # Strategy: find the largest disk that is NOT the boot device.
+          BOOT_DISK=""
+          # Find which disk has the COS_STATE partition (Kairos boot marker)
+          for dev in /dev/sd[a-z] /dev/nvme[0-9]n[0-9]; do
+            [ -b "$dev" ] || continue
+            if blkid "$dev" 2>/dev/null | grep -q "COS_STATE\|COS_PERSISTENT\|cos-state" || \
+               lsblk -no PARTLABEL "$dev" 2>/dev/null | grep -qi "COS"; then
+              BOOT_DISK="$dev"
+              break
+            fi
+          done
+          # Fallback: the boot disk is the one mounted at /
+          if [ -z "$BOOT_DISK" ]; then
+            BOOT_DISK=$(findmnt -no SOURCE / | sed 's/[0-9]*$//' | sed 's/p$//')
+          fi
+
+          # Find the largest disk that isn't the boot disk
+          SSD_DISK=""
+          SSD_SIZE=0
+          for dev in /dev/sd[a-z] /dev/nvme[0-9]n[0-9]; do
+            [ -b "$dev" ] || continue
+            [ "$dev" = "$BOOT_DISK" ] && continue
+            size=$(blockdev --getsize64 "$dev" 2>/dev/null || echo 0)
+            if [ "$size" -gt "$SSD_SIZE" ]; then
+              SSD_DISK="$dev"
+              SSD_SIZE="$size"
+            fi
+          done
+
+          if [ -z "$SSD_DISK" ]; then
+            echo "No SSD found (only boot disk $BOOT_DISK detected). PVCs will use the boot drive."
+            exit 0
+          fi
+
+          echo "Found SSD: $SSD_DISK ($((SSD_SIZE / 1024 / 1024 / 1024)) GB), boot disk: $BOOT_DISK"
+
+          # Wipe any existing partition table and create a single partition
+          wipefs -a "$SSD_DISK" 2>/dev/null || true
+          dd if=/dev/zero of="$SSD_DISK" bs=1M count=10 2>/dev/null || true
+
+          # Create a single partition using fdisk
+          echo -e "o\nn\np\n1\n\n\nw" | fdisk "$SSD_DISK" 2>/dev/null || true
+
+          # Wait for the partition device to appear
+          sleep 2
+          # Handle both /dev/sdX1 and /dev/nvmeXnYp1 naming
+          if [ -b "${SSD_DISK}1" ]; then
+            SSD_PART="${SSD_DISK}1"
+          elif [ -b "${SSD_DISK}p1" ]; then
+            SSD_PART="${SSD_DISK}p1"
+          else
+            echo "Partition not found after fdisk. Trying whole disk."
+            SSD_PART="$SSD_DISK"
+          fi
+
+          # Format with ext4 and the kairos-ssd label
+          mkfs.ext4 -F -L kairos-ssd "$SSD_PART"
+
+          # Mount via systemd
+          systemctl daemon-reload
+          systemctl enable usr-local-ssd.mount
+          systemctl start usr-local-ssd.mount
+
+          echo "SSD formatted and mounted at /usr/local/ssd"
+
+          # Configure k3s to use the SSD for ALL its data (container image layers,
+          # etcd, TLS certs, PVC storage). This is the key performance fix:
+          # containerd's overlay filesystem for container images lives here, so
+          # static files (JS/CSS) are served from fast SSD I/O, not the pen drive.
+          mkdir -p /etc/rancher/k3s /usr/local/ssd/k3s-data
+          if ! grep -q "data-dir" /etc/rancher/k3s/config.yaml 2>/dev/null; then
+            cat >> /etc/rancher/k3s/config.yaml << 'EOCONF'
+data-dir: /usr/local/ssd/k3s-data
+EOCONF
+          fi
 EOF
 ```
 
@@ -128,6 +245,20 @@ Verify it looks right:
 ```bash
 cat ~/kairos-flash/cloud-config-pi1.yaml
 ```
+
+### What this flash-time config does
+
+| Stage | What | Why |
+|-------|------|-----|
+| **fs** (first) | Detect SSD, format with `kairos-ssd` label, mount at `/usr/local/ssd` | Runs BEFORE k3s starts, so k3s data is on SSD from first boot |
+| **fs** (first) | Write k3s config: `data-dir: /usr/local/ssd/k3s-data` | All k3s data (container images, etcd, PVCs) goes to SSD, not pen drive |
+| **boot** | Pull repo tarball, sync `cloud-config/*.yaml` to `/oem/` | Makes cloud-config self-updating from GitHub |
+
+### Why this matters
+
+- **First boot:** SSD is mounted and formatted before k3s starts. k3s immediately uses SSD for all data.
+- **Grafana performance:** Container image layers (including Grafana's JS files) are on SSD. JS files load in ~30ms instead of ~30s.
+- **Fleet consistency:** Every Pi uses the same flash-time config, so SSD setup is identical across the fleet.
 
 ---
 
@@ -296,32 +427,37 @@ Previously on pen drive this took 30s+.
 
 ### Static IP not applied — Pi comes up with a different IP
 
-Check the network config files and which one networkd is actually using:
+Check which network file networkd is actually using:
 
 ```bash
-sudo ls -la /etc/systemd/network/
-sudo networkctl status end0 | grep "Network File"
-sudo cat /etc/systemd/network/20-dhcp.network     # should say Name=en* !end0
-sudo cat /etc/systemd/network/99-end0-static.network
+sudo networkctl status end0 | grep -E "Network File|Address"
+sudo cat /etc/systemd/network/20-dhcp.network
 ```
 
-If `20-dhcp.network` still says `Name=en*` (without `!end0`), the `write_files` from the
-flash-time config didn't take effect. This can happen if Kairos's own init re-generated the
-file after ours was written. Force it now:
+`20-dhcp.network` should show `Name=end0` and `DHCP=no`. If it still shows the stock
+`Name=en*` / `DHCP=yes`, the `write_files` didn't take effect. Fix it now:
 
 ```bash
 sudo bash -c 'cat > /etc/systemd/network/20-dhcp.network << EOF
 [Match]
-Name=en* !end0
+Name=end0
 
 [Network]
-DHCP=yes
-[DHCP]
-ClientIdentifier=mac
+DHCP=no
+Address=192.168.1.34/24
+Gateway=192.168.1.1
+DNS=192.168.1.1
+DNS=8.8.8.8
 EOF'
 sudo networkctl reload && sudo networkctl reconfigure end0
+sleep 3
 ip addr show end0 | grep inet
 ```
+
+> **Why this approach?** On the Kairos Hadron v0.5.1 (systemd-networkd on musl), only
+> `20-dhcp.network` is ever applied to `end0`, regardless of other matching files or sort
+> order. The `!end0` negation syntax is also not supported. Overwriting `20-dhcp.network`
+> directly is the only reliable fix.
 
 ### SSD not detected after Boot 2
 
